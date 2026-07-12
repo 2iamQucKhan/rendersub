@@ -1,0 +1,13 @@
+yt-dlp
+pydub
+easyocr
+google-generativeai
+edge-tts
+deep-translator
+PyQt6
+pysrt
+openai-whisper
+opencv-python
+pillow
+audioop-lts
+
