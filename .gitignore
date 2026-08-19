@@ -34,6 +34,8 @@ node_modules/
 dist/
 build/
 .turbo/
+bin/*.exe
+*.exe
 
 # Unrelated projects kept locally
 9router/

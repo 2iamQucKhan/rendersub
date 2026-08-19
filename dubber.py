@@ -16,10 +16,17 @@ from pydub import AudioSegment
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from resource_utils import get_ffmpeg_path, get_ffprobe_path, get_resource_path
+
 _SUPPORTED_VOICES_CACHE = None
 
 
 def _run_ffmpeg(cmd, action_label):
+    if cmd:
+        if cmd[0] == "ffmpeg":
+            cmd[0] = get_ffmpeg_path()
+        elif cmd[0] == "ffprobe":
+            cmd[0] = get_ffprobe_path()
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except FileNotFoundError as exc:
@@ -961,7 +968,7 @@ def create_dubbed_video(video_path, segments, voice, output_video_path, bg_volum
 
         has_orig_audio = False
         try:
-            cmd_probe = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", video_path]
+            cmd_probe = [get_ffprobe_path(), "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", video_path]
             p_res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=4)
             has_orig_audio = bool(p_res.stdout.strip())
         except Exception:

@@ -60,8 +60,9 @@ def extract_audio(video_path, audio_path=None):
     audio = Path(audio_path).expanduser() if audio_path else video.with_suffix(".wav")
     audio.parent.mkdir(parents=True, exist_ok=True)
 
+    from resource_utils import get_ffmpeg_path
     cmd = [
-        "ffmpeg", "-y",
+        get_ffmpeg_path(), "-y",
         "-i", str(video),
         "-vn",
         "-acodec", "pcm_s16le",

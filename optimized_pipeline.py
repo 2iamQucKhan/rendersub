@@ -9,6 +9,8 @@ import threading
 import numpy as np
 import cv2
 
+from resource_utils import get_ffmpeg_path, get_ffprobe_path, get_resource_path
+
 def is_ascii_path(path_str):
     try:
         path_str.encode('ascii')
@@ -186,7 +188,7 @@ def validate_output_video(file_path, check_audio=False, min_duration=0.1):
     if check_audio:
         try:
             cmd = [
-                "ffprobe", "-v", "error",
+                get_ffprobe_path(), "-v", "error",
                 "-select_streams", "a:0",
                 "-show_entries", "stream=codec_name,duration",
                 "-of", "default=noprint_wrappers=1:nokey=1",
@@ -220,7 +222,7 @@ def probe_encoder_support(encoder_name):
     """Kiểm tra xem hệ thống có hỗ trợ video encoder này hay không bằng ffmpeg test pipe tới null."""
     try:
         cmd = [
-            "ffmpeg", "-y",
+            get_ffmpeg_path(), "-y",
             "-f", "rawvideo",
             "-pix_fmt", "bgr24",
             "-s", "16x16",
@@ -265,7 +267,7 @@ class FFmpegVideoWriter:
         self._init_ffmpeg(codec)
 
     def _init_ffmpeg(self, codec):
-        ffmpeg_bin = "ffmpeg"
+        ffmpeg_bin = get_ffmpeg_path()
         
         chosen_encoder = None
         if codec == "nvenc" or (codec == "auto" and probe_encoder_support("h264_nvenc")):
@@ -595,7 +597,7 @@ def fast_chunk_video(video_path, chunk_duration_s=20.0, overlap_s=1.5, temp_dir=
         out_chunk_path = os.path.join(temp_dir, f"chunk_{chunk_idx:03d}.mp4")
 
         cmd = [
-            "ffmpeg", "-y",
+            get_ffmpeg_path(), "-y",
             "-ss", f"{curr_start:.3f}",
             "-i", video_path,
             "-t", f"{chunk_dur:.3f}",
@@ -1002,7 +1004,7 @@ class StreamingLongVideoProcessor:
 
             # Cắt 1 chunk duy nhất trên ổ đĩa
             cmd = [
-                "ffmpeg", "-y",
+                get_ffmpeg_path(), "-y",
                 "-ss", f"{curr_start:.3f}",
                 "-i", self.video_path,
                 "-t", f"{chunk_dur:.3f}",

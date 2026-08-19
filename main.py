@@ -38,6 +38,9 @@ import csv
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
+from resource_utils import setup_app_environment, get_ffmpeg_path, get_ffprobe_path, get_resource_path, get_user_data_dir
+setup_app_environment()
+
 class WorkerTaskSignals(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str)
@@ -3669,9 +3672,10 @@ class MainWindow(QMainWindow):
                 self.txt_log_console.append(f"📁 Thư mục Log/Cache: {log_dir}")
 
     def load_app_settings(self):
-        settings_file = os.path.join(os.path.dirname(__file__), "config", "app_settings.json")
-        if not os.path.exists(settings_file):
-            settings_file = os.path.abspath(os.path.join("config", "app_settings.json"))
+        user_settings = os.path.join(get_user_data_dir(), "config", "app_settings.json")
+        bundle_settings = get_resource_path(os.path.join("config", "app_settings.json"))
+        
+        settings_file = user_settings if os.path.exists(user_settings) else bundle_settings
         if os.path.exists(settings_file):
             try:
                 with open(settings_file, "r", encoding="utf-8") as f:
@@ -3748,33 +3752,18 @@ class MainWindow(QMainWindow):
                     if hasattr(self, 'apply_dark_mode'):
                         self.apply_dark_mode(bool(data["dark_mode"]))
 
-                if "preferred_voice" in data and hasattr(self, 'cb_voice') and self.cb_voice:
-                    pvoice = data["preferred_voice"]
-                    idx = self.cb_voice.findData(pvoice)
-                    if idx >= 0:
-                        self.cb_voice.setCurrentIndex(idx)
-
-                if "default_engine" in data and hasattr(self, 'cb_engine') and self.cb_engine:
-                    idx = self.cb_engine.findText(data["default_engine"], Qt.MatchFlag.MatchContains)
-                    if idx >= 0:
-                        self.cb_engine.setCurrentIndex(idx)
-
-                if "translation_engine" in data and hasattr(self, 'cb_translation_engine'):
-                    self.cb_translation_engine.setCurrentText(str(data["translation_engine"]))
-                if "auto_report" in data and hasattr(self, 'chk_auto_report'):
-                    self.chk_auto_report.setChecked(bool(data["auto_report"]))
-                if "report_format" in data and hasattr(self, 'cb_report_format'):
-                    self.cb_report_format.setCurrentText(str(data["report_format"]))
+                if "preferred_voice" in data and hasattr(self, 'cb_voice'):
+                    v_val = data["preferred_voice"]
+                    idx = self.cb_voice.findData(v_val)
+                    if idx >= 0: self.cb_voice.setCurrentIndex(idx)
+                if "default_engine" in data and hasattr(self, 'cb_engine'):
+                    self.cb_engine.setCurrentText(data["default_engine"])
+                if "default_sub_position" in data and hasattr(self, 'cb_v_align'):
+                    self.cb_v_align.setCurrentText(data["default_sub_position"])
                 if "gemini_model" in data and hasattr(self, 'cb_gemini_model'):
-                    self.cb_gemini_model.setCurrentText(str(data["gemini_model"]))
-                if "gemini_auto_fallback_model" in data and hasattr(self, 'chk_gemini_auto_fallback_model'):
-                    self.chk_gemini_auto_fallback_model.setChecked(bool(data["gemini_auto_fallback_model"]))
-                if "gemini_fallback_easyocr" in data and hasattr(self, 'chk_gemini_fallback_easyocr'):
-                    self.chk_gemini_fallback_easyocr.setChecked(bool(data["gemini_fallback_easyocr"]))
-                if "open_folder_on_done" in data and hasattr(self, 'chk_open_folder_on_done'):
-                    self.chk_open_folder_on_done.setChecked(bool(data["open_folder_on_done"]))
-                if "scan_interval" in data and hasattr(self, 'spin_scan_interval'):
-                    self.spin_scan_interval.setValue(float(data["scan_interval"]))
+                    self.cb_gemini_model.setCurrentText(data["gemini_model"])
+                if "translation_engine" in data and hasattr(self, 'cb_translation_engine'):
+                    self.cb_translation_engine.setCurrentText(data["translation_engine"])
                 if "scan_interval" in data and hasattr(self, 'spin_scan_interval'):
                     self.spin_scan_interval.setValue(float(data["scan_interval"]))
                 if "min_sub_dur" in data and hasattr(self, 'spin_min_sub_dur'):
@@ -3786,9 +3775,9 @@ class MainWindow(QMainWindow):
                 print(f"[SETTINGS] Error loading app_settings.json: {e}")
 
     def save_app_settings(self):
-        key_dir = os.path.join(os.path.dirname(__file__), "config")
-        os.makedirs(key_dir, exist_ok=True)
-        settings_file = os.path.join(key_dir, "app_settings.json")
+        user_key_dir = os.path.join(get_user_data_dir(), "config")
+        os.makedirs(user_key_dir, exist_ok=True)
+        settings_file = os.path.join(user_key_dir, "app_settings.json")
 
         workers_val = 4
         if hasattr(self, 'spin_workers') and self.spin_workers:

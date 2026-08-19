@@ -680,12 +680,9 @@ class VietPhraseTranslator:
             progress_callback("Đang nạp toàn bộ từ điển Hán Việt, VietPhrase, Lạc Việt và Babylon (vui lòng đợi)...")
             
         # Tìm đường dẫn mặc định trong thư mục Data của dự án
+        from resource_utils import get_resource_path
         def get_default_path(filename):
-            if getattr(sys, 'frozen', False):
-                base_path = sys._MEIPASS
-            else:
-                base_path = os.path.dirname(os.path.abspath(__file__))
-            return os.path.join(base_path, "Data", filename)
+            return get_resource_path(os.path.join("Data", filename))
             
         vp = self.vp_path or get_default_path("VietPhrase.txt")
         names = self.names_path or get_default_path("Names.txt")
