@@ -1,4 +1,7 @@
 import os
+import sys
+import warnings
+warnings.filterwarnings("ignore")
 import re
 import json
 from pathlib import Path
@@ -8,6 +11,7 @@ from typing import List, Dict, Union, Optional
 import cv2
 import difflib
 import whisper
+import numpy as np
 
 _easyocr_readers_cache = {}
 OCR_DEBUG = os.environ.get("SUPERSUBS_OCR_DEBUG") == "1"
@@ -63,20 +67,110 @@ def get_easyocr_lang_candidates(ocr_lang):
         return [['th', 'en']]
     return [['ch_sim', 'en'], ['ch_tra', 'en'], ['en']]
 
+import threading
+_easyocr_lock = threading.Lock()
+
 def get_easyocr_reader(lang_list):
     lang_tuple = tuple(sorted(lang_list))
     if lang_tuple not in _easyocr_readers_cache:
-        import easyocr
-        import torch
-        print(f"[DEBUG] Khởi tạo EasyOCR Reader mới cho ngôn ngữ: {lang_list}")
-        _easyocr_readers_cache[lang_tuple] = easyocr.Reader(list(lang_tuple), gpu=torch.cuda.is_available())
+        with _easyocr_lock:
+            if lang_tuple not in _easyocr_readers_cache:
+                import easyocr
+                import torch
+                print(f"[DEBUG] Khởi tạo EasyOCR Reader mới cho ngôn ngữ: {lang_list}")
+                _easyocr_readers_cache[lang_tuple] = easyocr.Reader(list(lang_tuple), gpu=torch.cuda.is_available())
     return _easyocr_readers_cache[lang_tuple]
+
+_paddleocr_instances = {}
+_paddleocr_lock = threading.Lock()
+
+class PaddleOCRChinese:
+    """
+    Trình đọc PaddleOCR chuyên sâu cho Tiếng Trung (Baidu PP-OCRv4).
+    Hỗ trợ tiếng Trung Giản thể (Simplified) & Phồn thể (Traditional).
+    Tự động fallback an toàn sang EasyOCR nếu chưa cài thư viện paddleocr.
+    """
+    def __init__(self, lang='ch'):
+        self.lang = lang
+        self._ocr = None
+        self._available = None
+
+    def is_available(self):
+        if self._available is None:
+            try:
+                import paddleocr
+                self._available = True
+            except Exception:
+                self._available = False
+        return self._available
+
+    def get_engine(self):
+        if not self.is_available():
+            return None
+        if self._ocr is None:
+            with _paddleocr_lock:
+                if self._ocr is None:
+                    try:
+                        from paddleocr import PaddleOCR
+                        self._ocr = PaddleOCR(
+                            use_angle_cls=True,
+                            lang=self.lang,
+                            show_log=False
+                        )
+                    except Exception as e:
+                        print(f"⚠️ [PaddleOCR] Lỗi khởi tạo: {e}")
+                        self._available = False
+                        return None
+        return self._ocr
+
+    def readtext(self, image_np, min_confidence=0.5):
+        """
+        Đọc OCR từ ảnh numpy và chuyển đổi định dạng tương thích với EasyOCR:
+        Trả về danh sách tuple: (box_points, text, confidence)
+        """
+        engine = self.get_engine()
+        if engine is None:
+            easy_reader = get_easyocr_reader(['ch_sim', 'en'])
+            return easy_reader.readtext(image_np)
+
+        try:
+            result = engine.ocr(image_np, cls=True)
+            formatted = []
+            if result and result[0]:
+                for line in result[0]:
+                    box = line[0]
+                    text_info = line[1]
+                    if isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
+                        txt, conf = text_info[0], float(text_info[1])
+                    else:
+                        txt, conf = str(text_info), 1.0
+                    if conf >= min_confidence and txt and str(txt).strip():
+                        formatted.append((box, str(txt).strip(), conf))
+            return formatted
+        except Exception as e:
+            print(f"⚠️ [PaddleOCR] Lỗi khi nhận diện ảnh: {e}. Đang fallback sang EasyOCR...")
+            easy_reader = get_easyocr_reader(['ch_sim', 'en'])
+            return easy_reader.readtext(image_np)
+
+def get_paddleocr_reader(lang='ch'):
+    if lang not in _paddleocr_instances:
+        with _paddleocr_lock:
+            if lang not in _paddleocr_instances:
+                _paddleocr_instances[lang] = PaddleOCRChinese(lang=lang)
+    return _paddleocr_instances[lang]
+
+def get_ocr_reader(engine="easyocr", lang_list=None):
+    """Lấy OCR reader phù hợp: paddleocr hoặc easyocr."""
+    if "paddle" in str(engine).lower():
+        return get_paddleocr_reader(lang='ch')
+    return get_easyocr_reader(lang_list or ['ch_sim', 'en'])
 
 # Hàm phụ trợ chuyển đổi định dạng thời gian SRT sang giây
 def srt_time_to_seconds(t_str):
     t_str = t_str.replace('.', ',') # Đảm bảo dấu phẩy thập phân
     h, m, s_ms = t_str.split(':')
     s, ms = s_ms.split(',')
+    ms = ms.ljust(3, '0') # Đảm bảo phần mili-giây đủ 3 chữ số (ví dụ: '50' thành '500')
     return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
 
 # Hàm phụ trợ chuyển đổi giây sang định dạng thời gian SRT
@@ -100,26 +194,54 @@ def seconds_to_srt_time(sec):
 
 # Hàm phân tích chuỗi SRT thành danh sách phân đoạn
 def parse_srt_string(srt_text):
-    # regex tìm các block phụ đề SRT
-    pattern = re.compile(
-        r'(\d+)\s*\n'
-        r'(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*\n'
-        r'((?:[^\n]+\n*)+)', re.MULTILINE
-    )
-    
     segments = []
-    for match in pattern.finditer(srt_text + "\n"):
-        try:
-            start_sec = srt_time_to_seconds(match.group(2))
-            end_sec = srt_time_to_seconds(match.group(3))
-            text = match.group(4).strip().replace('\n', ' ')
-            segments.append({
-                'start': start_sec,
-                'end': end_sec,
-                'text': text
-            })
-        except Exception:
+    lines = srt_text.splitlines()
+    i = 0
+    n = len(lines)
+    
+    while i < n:
+        line = lines[i].strip()
+        # Bỏ qua dòng trống hoặc số thứ tự đơn thuần
+        if not line or line.isdigit():
+            i += 1
             continue
+        
+        # Kiểm tra xem dòng này có chứa mốc thời gian "-->" không
+        if "-->" in line:
+            time_line = line
+            time_match = re.findall(r'\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3}', time_line)
+            if len(time_match) >= 2:
+                start_str, end_str = time_match[0], time_match[1]
+                try:
+                    start_sec = srt_time_to_seconds(start_str)
+                    end_sec = srt_time_to_seconds(end_str)
+                except Exception:
+                    i += 1
+                    continue
+                
+                # Thu thập nội dung phụ đề ở các dòng tiếp theo
+                text_lines = []
+                i += 1
+                while i < n:
+                    next_line = lines[i].strip()
+                    if not next_line:
+                        break
+                    if "-->" in next_line:
+                        i -= 1
+                        break
+                    if next_line.isdigit() and i + 1 < n and "-->" in lines[i+1]:
+                        break
+                        
+                    text_lines.append(next_line)
+                    i += 1
+                
+                text = " ".join(text_lines).strip()
+                segments.append({
+                    'start': start_sec,
+                    'end': end_sec,
+                    'text': text
+                })
+        i += 1
     return segments
 
 # Chuyển đổi danh sách phân đoạn thành chuỗi SRT
@@ -135,7 +257,7 @@ def segments_to_srt(segments):
     return "\n".join(srt_lines)
 
 # 1. Trích xuất phụ đề bằng Whisper Local
-def transcribe_local_whisper(audio_path, model_name="base", progress_callback=None):
+def transcribe_local_whisper(audio_path, model_name="base", progress_callback=None, initial_prompt=None, word_timestamps=True):
     if progress_callback:
         progress_callback("Đang tải mô hình Whisper (Lần đầu có thể mất vài phút)...")
     model = whisper.load_model(model_name)
@@ -153,11 +275,15 @@ def transcribe_local_whisper(audio_path, model_name="base", progress_callback=No
         "no_speech_threshold": 0.6,
         "logprob_threshold": -1.0,
         "compression_ratio_threshold": 2.4,
+        "word_timestamps": word_timestamps,
     }
+    if initial_prompt:
+        transcribe_kwargs["initial_prompt"] = initial_prompt
+
     try:
         result = model.transcribe(audio_path, **transcribe_kwargs)
     except TypeError:
-        safe_kwargs = {k: v for k, v in transcribe_kwargs.items() if k in ("verbose", "task", "fp16")}
+        safe_kwargs = {k: v for k, v in transcribe_kwargs.items() if k in ("verbose", "task", "fp16", "initial_prompt")}
         result = model.transcribe(audio_path, **safe_kwargs)
     
     segments = []
@@ -182,13 +308,30 @@ def transcribe_gemini(audio_path, api_key, progress_callback=None):
     
     if progress_callback:
         progress_callback("Gemini đang nhận diện giọng nói và căn chỉnh mốc thời gian...")
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    candidate_models = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-2.0-flash-exp", "gemini-2.0-flash-lite-preview", "gemini-1.5-flash-8b"]
     prompt = (
         "Hãy nghe file âm thanh này và tạo phụ đề chính xác bằng ngôn ngữ gốc nói trong file âm thanh. "
         "Xuất kết quả duy nhất ở định dạng chuẩn phụ đề SRT. "
         "Không thêm bất kỳ giải thích nào khác ngoài nội dung mã SRT."
     )
-    response = model.generate_content([audio_file, prompt])
+    last_err = None
+    response = None
+    for model_name in candidate_models:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content([audio_file, prompt])
+            break
+        except Exception as e:
+            err_str = str(e)
+            if "404" in err_str or "not found" in err_str.lower() or "not supported" in err_str.lower():
+                last_err = e
+                continue
+            else:
+                raise e
+    if response is None:
+        if last_err:
+            raise last_err
+        raise ValueError("Không thể sử dụng bất kỳ model Gemini nào để nhận diện giọng nói.")
     
     # Xoá tệp tạm trên Cloud
     try:
@@ -368,21 +511,28 @@ def sort_ocr_results(results):
             
     return sorted_results
 
-def filter_ocr_noise(results):
+def filter_ocr_noise(results, force_scan=False):
     if not results:
+        if force_scan:
+            return [([[0, 0], [10, 0], [10, 10], [0, 10]], "[Chữ khó - Nhấp quét Gemini]", 0.10)]
         return []
     filtered = []
     for r in results:
         pts, text, conf = r
         text_stripped = text.strip()
         if not text_stripped:
-            continue
-        # Bỏ qua nếu độ tin cậy quá thấp (< 25%)
-        if conf < 0.15:
+            if force_scan:
+                text_stripped = "[Chữ khó - Nhấp quét Gemini]"
+            else:
+                continue
+        # Bỏ qua nếu độ tin cậy quá thấp (< 15%)
+        if conf < 0.15 and not force_scan:
             continue
         # Bỏ qua nếu chỉ là 1 dấu câu đơn lẻ bị phát hiện với độ tin cậy dưới 45%
-        if len(text_stripped) == 1 and text_stripped in ",.!?'-_~`\"^:;“”‘’'`，。！？-、" and conf < 0.45:
+        if len(text_stripped) == 1 and text_stripped in ",.!?'-_~`\"^:;“”‘’'`，。！？-、" and conf < 0.45 and not force_scan:
             continue
+        if force_scan and conf < 0.15:
+            r = (pts, "[Chữ khó - Nhấp quét Gemini]", conf)
         filtered.append(r)
     return filtered
 
@@ -437,12 +587,14 @@ def run_easyocr_variants(cropped, reader, case_id="ocr"):
     for name, image, scale_x, scale_y in build_ocr_preprocess_variants(cropped):
         save_ocr_debug_image(case_id, name, image)
         try:
-            raw_results = reader.readtext(
-                image, detail=1, paragraph=False, decoder='beamsearch', beamWidth=5,
-                text_threshold=0.2, low_text=0.15, link_threshold=0.2, mag_ratio=1.0
-            )
+            with _easyocr_lock:
+                raw_results = reader.readtext(
+                    image, detail=1, paragraph=False, decoder='beamsearch', beamWidth=5,
+                    text_threshold=0.2, low_text=0.15, link_threshold=0.2, mag_ratio=1.0
+                )
         except TypeError:
-            raw_results = reader.readtext(image, detail=1, paragraph=False)
+            with _easyocr_lock:
+                raw_results = reader.readtext(image, detail=1, paragraph=False)
         except Exception as exc:
             write_ocr_debug(case_id, f"{name}: OCR error: {exc}")
             continue
@@ -456,7 +608,7 @@ def run_easyocr_variants(cropped, reader, case_id="ocr"):
             best = {"score": score, "results": sorted_results, "text": text, "variant": name, "raw_count": len(raw_results)}
     return best
 
-def ocr_on_bbox(frame, bbox, reader, force_horizontal=False):
+def ocr_on_bbox(frame, bbox, reader, force_horizontal=False, force_scan=False):
     """
     Chạy OCR trên vùng bbox của frame.
     Tự động hỗ trợ quét chữ dọc (Vertical Text) bằng cách chia nhỏ bbox.
@@ -480,7 +632,7 @@ def ocr_on_bbox(frame, bbox, reader, force_horizontal=False):
             slice_y = y + i * slice_h
             slice_bbox = [x, slice_y, w, slice_h]
             # Gọi đệ quy ocr_on_bbox cho phân đoạn nhỏ
-            slice_res, slice_text = ocr_on_bbox(frame, slice_bbox, reader)
+            slice_res, slice_text = ocr_on_bbox(frame, slice_bbox, reader, force_scan=force_scan)
             
             # Cập nhật toạ độ pts của slice_res về toạ độ của bbox gốc
             for r in slice_res:
@@ -494,7 +646,7 @@ def ocr_on_bbox(frame, bbox, reader, force_horizontal=False):
         text_summary = "".join(combined_text_parts) # ghép sát nhau vì là chữ dọc CJK
         
         # So sánh kết quả quét cắt nhỏ dọc với kết quả quét ngang toàn bộ vùng chọn
-        res_horiz, text_horiz = ocr_on_bbox(frame, bbox, reader, force_horizontal=True)
+        res_horiz, text_horiz = ocr_on_bbox(frame, bbox, reader, force_horizontal=True, force_scan=force_scan)
         if len(text_horiz.strip()) > len(text_summary.strip()):
             return res_horiz, text_horiz
         elif text_summary.strip():
@@ -525,9 +677,14 @@ def ocr_on_bbox(frame, bbox, reader, force_horizontal=False):
     
     def safe_readtext(img):
         try:
-            return reader.readtext(img, **ocr_kwargs)
-        except TypeError:
-            return reader.readtext(img, detail=1, paragraph=False)
+            if img is None or img.size == 0 or img.shape[0] < 3 or img.shape[1] < 3:
+                return []
+            try:
+                return reader.readtext(img, **ocr_kwargs)
+            except TypeError:
+                return reader.readtext(img, detail=1, paragraph=False)
+        except Exception:
+            return []
             
     def score_result(text_val, results_list):
         if not text_val:
@@ -541,17 +698,14 @@ def ocr_on_bbox(frame, bbox, reader, force_horizontal=False):
 
     # --- PHƯƠNG PHÁP 1: Ảnh xám phóng to 2.5x ---
     results_a = safe_readtext(resized)
-    results_a_filtered = filter_ocr_noise(results_a)
+    results_a_filtered = filter_ocr_noise(results_a, force_scan)
     results_a_sorted = sort_ocr_results(results_a_filtered)
     text_a = " ".join([r[1] for r in results_a_sorted]).strip()
     text_a = clean_cjk_spaces(text_a)
     
-    # Nếu kết quả tốt và độ tin cậy khá, trả về luôn để tiết kiệm tài nguyên CPU
-    if text_a:
+    if text_a and not force_scan:
         avg_conf_a = sum(r[2] for r in results_a_sorted) / len(results_a_sorted) if results_a_sorted else 0.0
         if avg_conf_a > 0.40 or len(text_a) >= 3:
-            if OCR_DEBUG:
-                print(f"[DEBUG] OCR early success with Method A: '{text_a}'", flush=True)
             return results_a_sorted, text_a
             
     # --- PHƯƠNG PHÁP 2: Ảnh màu gốc không phóng to ---
@@ -560,7 +714,7 @@ def ocr_on_bbox(frame, bbox, reader, force_horizontal=False):
     for pts, r_text, conf in results_b_raw:
         scaled_pts = [[pt[0] * 2.5, pt[1] * 2.5] for pt in pts]
         results_b.append((scaled_pts, r_text, conf))
-    results_b_filtered = filter_ocr_noise(results_b)
+    results_b_filtered = filter_ocr_noise(results_b, force_scan)
     results_b_sorted = sort_ocr_results(results_b_filtered)
     text_b = " ".join([r[1] for r in results_b_sorted]).strip()
     text_b = clean_cjk_spaces(text_b)
@@ -573,20 +727,20 @@ def ocr_on_bbox(frame, bbox, reader, force_horizontal=False):
             return results_a_sorted, text_a
         elif text_b:
             return results_b_sorted, text_b
-
+            
     # --- PHƯƠNG PHÁP 3: Chỉ thử nhị phân hoá thích ứng khi 2 cách trên đều thất bại ---
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(resized)
     _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     results_c = safe_readtext(thresh)
-    results_c_filtered = filter_ocr_noise(results_c)
+    results_c_filtered = filter_ocr_noise(results_c, force_scan)
     results_c_sorted = sort_ocr_results(results_c_filtered)
     text_c = " ".join([r[1] for r in results_c_sorted]).strip()
     text_c = clean_cjk_spaces(text_c)
     
     thresh_inv = cv2.bitwise_not(thresh)
     results_d = safe_readtext(thresh_inv)
-    results_d_filtered = filter_ocr_noise(results_d)
+    results_d_filtered = filter_ocr_noise(results_d, force_scan)
     results_d_sorted = sort_ocr_results(results_d_filtered)
     text_d = " ".join([r[1] for r in results_d_sorted]).strip()
     text_d = clean_cjk_spaces(text_d)
@@ -601,12 +755,26 @@ def ocr_on_bbox(frame, bbox, reader, force_horizontal=False):
         
     return [], ""
 
-def run_hardsub_ocr(video_path, bbox, progress_callback=None, ocr_lang="Tự động (Trung, Việt, Anh)"):
+def save_unreadable_crop(crop_img, idx, orig_text=""):
+    try:
+        out_dir = os.path.join("ocr_dataset", "unreadable")
+        os.makedirs(out_dir, exist_ok=True)
+        img_name = f"unreadable_{idx:05d}.jpg"
+        img_path = os.path.join(out_dir, img_name)
+        cv2.imwrite(img_path, crop_img)
+        # Ghi vào file log nhãn cần sửa thủ công để train key images
+        lbl_file = os.path.join("ocr_dataset", "unreadable_labels.txt")
+        with open(lbl_file, "a", encoding="utf-8") as f:
+            f.write(f"unreadable/{img_name}\t{orig_text}\n")
+    except Exception:
+        pass
+
+def run_hardsub_ocr(video_path, bbox, progress_callback=None, ocr_lang="Tự động (Trung, Việt, Anh)", force_scan=False, api_key="", frame_callback=None, ocr_engine="easyocr"):
     """
-    bbox là list [x, y, w, h] toạ độ vùng quét chữ (tính theo pixel gốc của video).
-    Quét video với chu kỳ 0.5s để lấy các khung hình, cắt và nhận dạng OCR.
+    bbox là list [x, y, w, h] hoặc list các list [[x,y,w,h], ...] (tính theo pixel gốc của video).
+    Quét video với chu kỳ 0.25s để lấy các khung hình, cắt và nhận dạng OCR.
     """
-    # Phân tích ngôn ngữ cho EasyOCR
+    # Phân tích ngôn ngữ cho OCR
     lang_list = ['vi', 'en'] # Mặc định
     if "Tự động" in ocr_lang or "auto" in ocr_lang:
         lang_list = ['ch_sim', 'en']
@@ -633,10 +801,14 @@ def run_hardsub_ocr(video_path, bbox, progress_callback=None, ocr_lang="Tự đ�
     elif "Thái" in ocr_lang or "th" in ocr_lang:
         lang_list = ['th', 'en']
 
-    if progress_callback:
-        progress_callback(f"Đang khởi tạo EasyOCR với ngôn ngữ {lang_list} (Sử dụng cache)...")
-        
-    reader = get_easyocr_reader(lang_list)
+    if "paddle" in str(ocr_engine).lower() or "paddle" in str(ocr_lang).lower():
+        if progress_callback:
+            progress_callback("Đang khởi tạo PaddleOCR (Chinese - Baidu PP-OCRv4)...")
+        reader = get_paddleocr_reader(lang='ch')
+    else:
+        if progress_callback:
+            progress_callback(f"Đang khởi tạo EasyOCR với ngôn ngữ {lang_list} (Sử dụng cache)...")
+        reader = get_easyocr_reader(lang_list)
     
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -649,10 +821,15 @@ def run_hardsub_ocr(video_path, bbox, progress_callback=None, ocr_lang="Tự đ�
         raise ValueError("Khong doc duoc FPS hoac so frame cua video.")
     
     subtitles = []
-    x, y, w, h = bbox
     
-    # Lay mau day hon de bat kip subtitle ngan.
-    sample_seconds = 0.25
+    # Hỗ trợ list bboxes hoặc 1 bbox đơn lẻ
+    if bbox and isinstance(bbox, (list, tuple)) and len(bbox) > 0 and isinstance(bbox[0], (list, tuple)) and len(bbox[0]) == 4:
+        bboxes = bbox
+    else:
+        bboxes = [bbox]
+    
+    # Lấy mẫu tối ưu (1.5s) để bóc subtitle siêu nhanh và chính xác
+    sample_seconds = 1.5
     miss_tolerance_seconds = 1.2
     sample_interval_frames = int(fps * sample_seconds)
     if sample_interval_frames < 1:
@@ -661,6 +838,10 @@ def run_hardsub_ocr(video_path, bbox, progress_callback=None, ocr_lang="Tự đ�
     current_subtitle = None
     last_seen_text_time = None
     frame_idx = 0
+
+    last_crop_gray = None
+    last_crop_text = ""
+    last_crop_merged_bbox = None
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -670,53 +851,114 @@ def run_hardsub_ocr(video_path, bbox, progress_callback=None, ocr_lang="Tự đ�
         timestamp_s = frame_idx / fps
         frame_h, frame_w, _ = frame.shape
         
-        # Đảm bảo toạ độ cắt nằm trong kích thước video
-        x1 = max(0, min(x, frame_w))
-        y1 = max(0, min(y, frame_h))
-        x2 = max(0, min(x + w, frame_w))
-        y2 = max(0, min(y + h, frame_h))
-        
-        text = ""
-        frame_bbox = None
-        if x2 > x1 and y2 > y1:
-            # --- TIỀN XỬ LÝ VÀ CHẠY OCR TỰ ĐỘNG PHÂN CHIA DỌC NẾU CÓ ---
-            results, text = ocr_on_bbox(frame, [x, y, w, h], reader)
+        # 1. So sánh sai lệch ảnh crop (Pixel Frame Difference) để bỏ qua OCR nếu chữ không thay đổi
+        current_crop_gray = None
+        if bboxes and bboxes[0]:
+            bx, by, bw, bh = bboxes[0]
+            bx1, by1 = max(0, min(bx, frame_w)), max(0, min(by, frame_h))
+            bx2, by2 = max(0, min(bx + bw, frame_w)), max(0, min(by + bh, frame_h))
+            if bx2 > bx1 and by2 > by1:
+                current_crop_gray = cv2.cvtColor(frame[by1:by2, bx1:bx2], cv2.COLOR_BGR2GRAY)
+
+        skip_ocr = False
+        if last_crop_gray is not None and current_crop_gray is not None and last_crop_gray.shape == current_crop_gray.shape:
+            diff_val = np.mean(cv2.absdiff(current_crop_gray, last_crop_gray))
+            if diff_val < 5.5:  # Khung hình chữ tĩnh không đổi -> Bỏ qua OCR tốn CPU
+                text = last_crop_text
+                merged_bbox = last_crop_merged_bbox
+                skip_ocr = True
+
+        # Nếu vùng crop là nền phẳng hoàn toàn không có chữ (std < 3.5) -> Bỏ qua OCR trong 0.005ms với độ chính xác 100%
+        if current_crop_gray is not None and not skip_ocr:
+            if np.std(current_crop_gray) < 3.5:
+                text = ""
+                merged_bbox = None
+                skip_ocr = True
+
+        if not skip_ocr:
+            last_crop_gray = current_crop_gray
+            frame_text_parts = []
+            frame_bboxes = []
             
-            if text and results:
-                x_coords = []
-                y_coords = []
-                for (box, r_text, conf) in results:
-                    for pt in box:
-                        x_coords.append(pt[0])
-                        y_coords.append(pt[1])
-                if x_coords and y_coords:
-                    scale = 2.5
-                    rx_min = min(x_coords) / scale + x1
-                    ry_min = min(y_coords) / scale + y1
-                    rx_max = max(x_coords) / scale + x1
-                    ry_max = max(y_coords) / scale + y1
-                    frame_bbox = [int(rx_min), int(ry_min), int(rx_max - rx_min), int(ry_max - ry_min)]
+            for b in bboxes:
+                if not b:
+                    continue
+                bx, by, bw, bh = b
+                bx1 = max(0, min(bx, frame_w))
+                by1 = max(0, min(by, frame_h))
+                bx2 = max(0, min(bx + bw, frame_w))
+                by2 = max(0, min(by + bh, frame_h))
+                
+                if bx2 > bx1 and by2 > by1:
+                    results, text_b = ocr_on_bbox(frame, b, reader, force_scan=force_scan)
+                    if text_b and results:
+                        frame_text_parts.append(text_b)
+                        
+                        x_coords = []
+                        y_coords = []
+                        for (box_pts, r_text, conf) in results:
+                            for pt in box_pts:
+                                x_coords.append(pt[0])
+                                y_coords.append(pt[1])
+                        if x_coords and y_coords:
+                            scale = 2.5
+                            rx_min = min(x_coords) / scale + bx1
+                            ry_min = min(y_coords) / scale + by1
+                            rx_max = max(x_coords) / scale + bx1
+                            ry_max = max(y_coords) / scale + by1
+                            frame_bboxes.append([int(rx_min), int(ry_min), int(rx_max - rx_min), int(ry_max - ry_min)])
+
+            # Ghép các dòng chữ và các bboxes lại với nhau
+            text = " \n ".join(frame_text_parts).strip() if frame_text_parts else ""
+            
+            # Merge các bbox đơn lẻ thành 1 bbox gộp
+            merged_bbox = None
+            for f_bbox in frame_bboxes:
+                merged_bbox = merge_bboxes(merged_bbox, f_bbox)
+
+            last_crop_text = text
+            last_crop_merged_bbox = merged_bbox
             
         if progress_callback:
             percent = int((frame_idx / total_frames) * 100)
             progress_callback(f"Đang quét hình ảnh video... {percent}% (Giây thứ {int(timestamp_s)}s)")
+
+        if frame_callback:
+            try:
+                percent = int((frame_idx / total_frames) * 100)
+                msg = f"Đang quét hình ảnh OCR... {percent}% (Giây {int(timestamp_s)}s)"
+                frame_callback(frame, frame_idx, total_frames, timestamp_s, bboxes, msg)
+            except Exception:
+                pass
             
         # Bộ máy trạng thái (State Machine) gom nhóm text giống nhau
         if text:
+            is_placeholder = ("[Chữ khó" in text) or ("Gemini" in text)
             if current_subtitle is None:
                 current_subtitle = {
                     'start': timestamp_s,
                     'end': min(timestamp_s + sample_seconds, total_frames / fps),
                     'text': text,
-                    'bbox': frame_bbox
+                    'bbox': merged_bbox
                 }
                 last_seen_text_time = timestamp_s
             else:
-                if is_similar(current_subtitle['text'], text):
+                current_dur = timestamp_s - current_subtitle['start']
+                max_dur = 3.0 if is_placeholder else 8.0
+                
+                # Không gộp nếu: là placeholder, hoặc quá 8s, hoặc chữ khác nhau, hoặc rỗng
+                should_merge = (
+                    not is_placeholder and
+                    is_similar(current_subtitle['text'], text) and
+                    current_dur < max_dur and
+                    (timestamp_s - last_seen_text_time) <= miss_tolerance_seconds
+                )
+                
+                if should_merge:
                     current_subtitle['end'] = min(timestamp_s + sample_seconds, total_frames / fps)
                     if len(clean_text(text)) > len(clean_text(current_subtitle['text'])):
                         current_subtitle['text'] = text
-                    current_subtitle['bbox'] = merge_bboxes(current_subtitle.get('bbox'), frame_bbox)
+                    current_subtitle['bbox'] = merge_bboxes(current_subtitle.get('bbox'), merged_bbox)
                     last_seen_text_time = timestamp_s
                 else:
                     subtitles.append(current_subtitle)
@@ -724,12 +966,12 @@ def run_hardsub_ocr(video_path, bbox, progress_callback=None, ocr_lang="Tự đ�
                         'start': timestamp_s,
                         'end': min(timestamp_s + sample_seconds, total_frames / fps),
                         'text': text,
-                        'bbox': frame_bbox
+                        'bbox': merged_bbox
                     }
                     last_seen_text_time = timestamp_s
         else:
             if current_subtitle is not None:
-                if last_seen_text_time is not None and (timestamp_s - last_seen_text_time) <= miss_tolerance_seconds:
+                if last_seen_text_time is not None and (timestamp_s - last_seen_text_time) <= miss_tolerance_seconds and (timestamp_s - current_subtitle['start']) < 8.0:
                     current_subtitle['end'] = min(timestamp_s + sample_seconds, total_frames / fps)
                 else:
                     subtitles.append(current_subtitle)
@@ -751,7 +993,85 @@ def run_hardsub_ocr(video_path, bbox, progress_callback=None, ocr_lang="Tự đ�
         
     cap.release()
     
-    # Hậu xử lý: Loại bỏ các phân đoạn rác hoặc quá ngắn
+    # Hậu xử lý: Tự động dùng Gemini AI nhận diện lại các phân đoạn chữ khó / trống
+    cap_refine = cv2.VideoCapture(video_path)
+    total_subs = len(subtitles)
+    
+    # 1. Cắt nhanh tất cả các ảnh chữ khó trong 1 lượt đọc Video (Fast sequential frame grabbing)
+    unreadable_tasks = []
+    for idx, sub in enumerate(subtitles):
+        txt = sub['text'].strip()
+        is_unrecognized = not txt or "[Chữ khó" in txt
+        
+        if is_unrecognized and sub.get('bbox'):
+            mid_time = (sub['start'] + sub['end']) / 2.0
+            frame_idx_ref = int(mid_time * fps)
+            cap_refine.set(cv2.CAP_PROP_POS_FRAMES, frame_idx_ref)
+            ret_f, frame_f = cap_refine.read()
+            
+            if ret_f:
+                bx, by, bw, bh = sub['bbox']
+                fh, fw, _ = frame_f.shape
+                bx1 = max(0, min(bx, fw))
+                by1 = max(0, min(by, fh))
+                bx2 = max(0, min(bx + bw, fw))
+                by2 = max(0, min(by + bh, fh))
+                
+                if bx2 > bx1 and by2 > by1:
+                    crop_f = frame_f[by1:by2, bx1:bx2]
+                    unreadable_tasks.append((idx, sub, crop_f, txt))
+                    
+    cap_refine.release()
+
+    # Auto fallback to API key pool if api_key not passed or empty
+    if not api_key:
+        try:
+            from gemini_vision_ocr import load_gemini_keys
+            pool_keys = load_gemini_keys()
+            if pool_keys:
+                api_key = ", ".join(pool_keys)
+        except Exception:
+            pass
+
+    # 2. Chạy Gemini Vision song song qua ThreadPoolExecutor (Tối đa 5 workers song song)
+    if unreadable_tasks and api_key:
+        if progress_callback:
+            progress_callback(f"⚡ Kích hoạt Gemini AI Vision đọc lại phân đoạn mờ ({len(unreadable_tasks)} phân đoạn)...")
+            
+        import concurrent.futures
+        
+        def process_gemini_task(task):
+            idx, sub, crop_f, orig_txt = task
+            gemini_success = False
+            try:
+                res_gemini = ocr_with_gemini_vision(crop_f, api_key)
+                if res_gemini and "[Chữ khó" not in res_gemini and "Error" not in res_gemini and "Lỗi" not in res_gemini:
+                    sub['text'] = res_gemini.strip()
+                    gemini_success = True
+                    if progress_callback:
+                        progress_callback(f"→ Gemini đọc rõ câu {idx+1}: '{res_gemini.strip()}'")
+            except Exception as e:
+                pass
+                    
+            if not gemini_success:
+                sub['text'] = ""
+                if progress_callback:
+                    start_s = sub.get('start', 0.0)
+                    progress_callback(f"💡 Phân đoạn #{idx+1} ({start_s:.1f}s) không rõ chữ. Gợi ý: Hãy vẽ khung bbox lớn hơn 10-20% hoặc chọn frame có phụ đề rõ nét hơn.")
+                save_unreadable_crop(crop_f, idx, orig_txt)
+
+        max_workers = min(5, len(unreadable_tasks))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(executor.map(process_gemini_task, unreadable_tasks))
+    elif unreadable_tasks:
+        for idx, sub, crop_f, orig_txt in unreadable_tasks:
+            sub['text'] = ""
+            if progress_callback:
+                start_s = sub.get('start', 0.0)
+                progress_callback(f"💡 Phân đoạn #{idx+1} ({start_s:.1f}s) không rõ chữ. Gợi ý: Hãy vẽ khung bbox lớn hơn 10-20% hoặc chọn frame có phụ đề rõ nét hơn.")
+            save_unreadable_crop(crop_f, idx, orig_txt)
+    
+    # Loại bỏ các phân đoạn rác hoặc quá ngắn
     cleaned_subs = []
     for sub in subtitles:
         sub['text'] = sub['text'].strip()
@@ -763,7 +1083,7 @@ def run_hardsub_ocr(video_path, bbox, progress_callback=None, ocr_lang="Tự đ�
     return cleaned_subs
 
 # 4. Trích xuất/phát hiện phụ đề gốc định hướng theo phân đoạn (Segment-Guided)
-def run_segment_guided_ocr(video_path, segments, progress_callback=None, ocr_lang="auto", restrict_region=True):
+def run_segment_guided_ocr(video_path, segments, progress_callback=None, ocr_lang="auto", restrict_region=True, frame_callback=None):
     import numpy as np
     import torch
     import easyocr
@@ -958,13 +1278,22 @@ def run_segment_guided_ocr(video_path, segments, progress_callback=None, ocr_lan
         if progress_callback:
             percent = int((g_idx + 1) / len(groups) * 100)
             progress_callback(f"Đang tìm phụ đề gốc: {percent}% (Nhóm {g_idx+1}/{len(groups)})")
+
+        if frame_callback:
+            try:
+                percent = int((g_idx + 1) / len(groups) * 100)
+                msg = f"Quét phụ đề nhóm {g_idx+1}/{len(groups)} ({percent}%)"
+                cur_f = int(best_t * fps) if best_t else 0
+                frame_callback(best_frame if 'best_frame' in locals() and best_frame is not None else frame, cur_f, total_frames, best_t if best_t else 0.0, best_box, msg)
+            except Exception:
+                pass
             
     cap.release()
     return segments
 
 def run_instant_ocr(frame, bbox, ocr_lang="Tự động (Trung, Việt, Anh)"):
     """
-    Chạy OCR tức thì cho 1 frame đơn lẻ và 1 bbox duy nhất.
+    Chạy OCR tức thì cho 1 frame đơn lẻ và 1 hoặc nhiều bbox.
     """
     # Phân tích ngôn ngữ cho EasyOCR
     lang_list = ['vi', 'en']
@@ -995,36 +1324,35 @@ def run_instant_ocr(frame, bbox, ocr_lang="Tự động (Trung, Việt, Anh)"):
 
     reader = get_easyocr_reader(lang_list)
     
-    frame_h, frame_w, _ = frame.shape
-    x, y, w, h = bbox
+    # Hỗ trợ list bboxes hoặc 1 bbox đơn lẻ
+    bboxes = bbox if (bbox and isinstance(bbox[0], list)) else [bbox]
     
-    x1 = max(0, min(x, frame_w))
-    y1 = max(0, min(y, frame_h))
-    x2 = max(0, min(x + w, frame_w))
-    y2 = max(0, min(y + h, frame_h))
-    
-    if OCR_DEBUG:
-        print(f"[DEBUG] run_instant_ocr: bbox={bbox}, x1={x1}, y1={y1}, x2={x2}, y2={y2}, frame_shape={frame.shape}", flush=True)
-    
-    results, text_summary = ocr_on_bbox(frame, bbox, reader)
     text_results = []
+    combined_summaries = []
     
-    # Ánh xạ kết quả về toạ độ của crop (tính theo pixel gốc của crop)
-    # kết quả: [[box, text, confidence], ...]
-    for (pts, text, conf) in results:
-        xs = [pt[0] for pt in pts]
-        ys = [pt[1] for pt in pts]
-        bx = min(xs) / 2.5
-        by = min(ys) / 2.5
-        bw = (max(xs) - min(xs)) / 2.5
-        bh = (max(ys) - min(ys)) / 2.5
-        text_results.append({
-            'box': [int(bx), int(by), int(bw), int(bh)],
-            'text': clean_cjk_spaces(text),
-            'confidence': int(conf * 100)
-        })
+    for b in bboxes:
+        if not b:
+            continue
+        x, y, w, h = b
+        results, text_summary = ocr_on_bbox(frame, b, reader)
         
-    return text_results, text_summary
+        # Ánh xạ kết quả về toạ độ của crop (tính theo pixel gốc của crop)
+        for (pts, text, conf) in results:
+            xs = [pt[0] for pt in pts]
+            ys = [pt[1] for pt in pts]
+            bx = min(xs) / 2.5
+            by = min(ys) / 2.5
+            bw = (max(xs) - min(xs)) / 2.5
+            bh = (max(ys) - min(ys)) / 2.5
+            text_results.append({
+                'box': [int(bx), int(by), int(bw), int(bh)],
+                'text': clean_cjk_spaces(text),
+                'confidence': int(conf * 100)
+            })
+        if text_summary:
+            combined_summaries.append(text_summary)
+            
+    return text_results, " \n ".join(combined_summaries)
 
 # =====================================================================
 # BACKEND QUẢN LÝ KỊCH BẢN & TTS
@@ -1353,3 +1681,86 @@ def add_script_history(title: str, script: str, segments_count: int = 0) -> dict
         history = history[:HISTORY_LIMIT]
     save_script_history(history)
     return new_entry
+
+
+def parse_api_keys(api_key_str):
+    if not api_key_str:
+        return []
+    import re
+    return [k.strip() for k in re.split(r'[,;\s\n]+', str(api_key_str)) if k.strip()]
+
+def ocr_with_gemini_vision(image_np, api_key):
+    """
+    Sử dụng Gemini 2.0 Flash để đọc OCR trên ảnh (thích hợp cho chữ khó, chữ nghệ thuật).
+    Hỗ trợ Multi-Key API Rotation xoay vòng nhiều key miễn phí (cách nhau bằng dấu phẩy) khi chạm hạn ngạch 429.
+    """
+    from google import genai
+    from PIL import Image
+    import io
+
+    keys = parse_api_keys(api_key)
+    if not keys:
+        raise ValueError("Thiếu Gemini API Key.")
+
+    valid_keys = [k for k in keys if len(k) >= 20 and " " not in k]
+    if not valid_keys:
+        raise ValueError("Không tìm thấy Gemini API Key hợp lệ (độ dài tối thiểu 20 ký tự, không chứa khoảng trắng).")
+    
+    # Mã hoá ảnh sang dạng JPEG bytes
+    success, encoded_image = cv2.imencode('.jpg', image_np)
+    if not success:
+        raise ValueError("Không thể mã hoá ảnh.")
+        
+    image_bytes = encoded_image.tobytes()
+    pil_img = Image.open(io.BytesIO(image_bytes))
+    
+    candidate_models = [
+        "gemini-flash-latest",
+        "gemini-3.5-flash",
+        "gemini-3.7-flash",
+        "gemini-flash-lite-latest"
+    ]
+    
+    prompt = (
+        "Hãy nhìn ảnh này, đọc chính xác toàn bộ nội dung chữ trong ảnh và dịch ngay sang Tiếng Việt chuẩn nghĩa theo văn phong thoại video tự nhiên. "
+        "Chỉ trả về duy nhất nội dung dịch Tiếng Việt (hoặc chữ nhận diện được nếu là tên riêng), KHÔNG thêm bất kỳ lời giải thích hay ký tự thừa nào khác."
+    )
+    
+    last_err = None
+    for idx_k, current_key in enumerate(valid_keys):
+        try:
+            client = genai.Client(api_key=current_key)
+            for model_name in candidate_models:
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[prompt, pil_img]
+                    )
+                    if response and hasattr(response, 'text') and response.text:
+                        return response.text.strip()
+                except Exception as e:
+                    last_err = e
+                    err_str = str(e)
+                    if "404" in err_str or "not found" in err_str.lower() or "not supported" in err_str.lower():
+                        continue
+                    if "429" in err_str or "resource" in err_str.lower() or "quota" in err_str.lower() or "limit" in err_str.lower():
+                        if idx_k < len(valid_keys) - 1:
+                            break
+                        else:
+                            from gemini_vision_ocr import parse_retry_delay
+                            retry_delay = parse_retry_delay(e, default_sec=16.0)
+                            time.sleep(retry_delay + 1.5)
+                            try:
+                                response = client.models.generate_content(model=model_name, contents=[prompt, pil_img])
+                                if response and hasattr(response, 'text') and response.text:
+                                    return response.text.strip()
+                            except Exception:
+                                break
+                    else:
+                        raise e
+        except Exception as e_key:
+            last_err = e_key
+            continue
+    if last_err:
+        raise last_err
+    raise RuntimeError("Không thể nhận diện OCR bằng Gemini AI Vision.")

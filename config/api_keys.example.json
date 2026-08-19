@@ -1,0 +1,8 @@
+{
+  "gemini_keys": [
+    "YOUR_GEMINI_API_KEY_HERE"
+  ],
+  "xkiro_keys": [
+    "YOUR_XKIRO_API_KEY_HERE"
+  ]
+}

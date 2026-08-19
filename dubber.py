@@ -1,6 +1,8 @@
 import os
 import asyncio
+import shutil
 import subprocess
+import tempfile
 import cv2
 import edge_tts
 from pydub import AudioSegment
@@ -110,8 +112,30 @@ async def _generate_tts_async(text, voice, output_path, rate="+0%", pitch="+0Hz"
         if not success:
             raise Exception("Tải giọng đọc Google TTS thất bại.")
         return
-    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-    await communicate.save(output_path)
+
+    max_retries = 3
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+            await communicate.save(output_path)
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                return
+        except Exception as e:
+            last_err = e
+            print(f"⚠️ [Lần thử {attempt}/{max_retries}] Lỗi kết nối Edge-TTS tới speech.platform.bing.com cho câu '{text[:30]}...': {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(attempt * 1.0)
+
+    print(f"⚠️ Edge-TTS thất bại 3 lần cho câu '{text[:30]}...'. Đang chuyển sang Google TTS làm phương án dự phòng...")
+    fallback_success = download_google_tts(text, output_path)
+    if fallback_success and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        print("🟢 Edge-TTS lỗi, đã chuyển sang Google TTS thành công!")
+        return
+
+    err_msg = f"❌ Thất bại cả Edge-TTS lẫn Google TTS cho câu: '{text}'"
+    print(err_msg)
+    raise Exception(err_msg)
 
 def generate_tts(text, voice, output_path, rate="+0%", pitch="+0Hz"):
     """
@@ -362,11 +386,16 @@ def get_text_block_size(lines, font):
     total_h = sum(line_heights) + line_spacing * (len(lines) - 1) if lines else 0
     return max_w, total_h, line_heights, line_spacing
 
-def apply_opencv_watermark_removal(frame, bbox, mask_mode="blur"):
+def apply_opencv_watermark_removal(frame, bbox, mask_mode="blur", inpainter=None):
     """
     Xóa hoặc che watermark/phụ đề cũ sử dụng OpenCV (Black Box, Gaussian Blur, hoặc Inpaint).
-    Hàm này được thiết kế mô-đun hóa để dễ dàng tích hợp thêm các mô hình YOLO/Template Matching trong tương lai.
+    Tự động áp dụng SmartFrameInpainter đệm diff nếu có.
     """
+    if frame is None or not bbox:
+        return frame
+    if inpainter is not None:
+        return inpainter.process_crop(frame, bbox, mask_mode=mask_mode)
+
     h_frame, w_frame, _ = frame.shape
     x, y, w, h = bbox
     x = max(0, min(x, w_frame))
@@ -398,18 +427,114 @@ def apply_opencv_watermark_removal(frame, bbox, mask_mode="blur"):
         
     return frame
 
-def draw_burned_subtitle(frame, text, bbox, default_bbox=None, font_path=None, preset=None):
+def insert_watermark_logo(frame, logo_path, bbox):
+    if not logo_path or not os.path.exists(logo_path):
+        return frame
+    x, y, w, h = bbox
+    h_frame, w_frame, _ = frame.shape
+    x = max(0, min(x, w_frame))
+    y = max(0, min(y, h_frame))
+    w = max(10, min(w, w_frame - x))
+    h = max(10, min(h, h_frame - y))
+    
+    logo = cv2.imread(logo_path, cv2.IMREAD_UNCHANGED)
+    if logo is None:
+        return frame
+        
+    logo_resized = cv2.resize(logo, (w, h))
+    
+    if logo_resized.shape[2] == 4:
+        alpha_logo = logo_resized[:, :, 3] / 255.0
+        alpha_frame = 1.0 - alpha_logo
+        
+        for c in range(0, 3):
+            frame[y:y+h, x:x+w, c] = (alpha_logo * logo_resized[:, :, c] +
+                                      alpha_frame * frame[y:y+h, x:x+w, c])
+    else:
+        frame[y:y+h, x:x+w] = logo_resized[:, :, :3]
+        
+    return frame
+
+def draw_burned_subtitle(frame, text, bbox, default_bbox=None, font_path=None, preset=None, selected_bboxes=None, logo_path=None, inpainter=None, title_text=None, title_bbox=None, logo_bbox=None):
     h_frame, w_frame, _ = frame.shape
     
-    # 1. Vẽ hộp che phụ đề cũ nếu dùng OpenCV và có bbox
+    # 1. Che/xóa các vùng quét đa điểm (selected_bboxes) và title_bbox bằng OpenCV
     remove_algo = preset.get("remove_algo", "opencv") if preset else "opencv"
-    if remove_algo != "ffmpeg":
+    mask_mode = preset.get("mask_mode", "blur") if preset else "blur"
+    
+    boxes_to_cover = []
+    if selected_bboxes:
+        boxes_to_cover = list(selected_bboxes)
+    else:
         box = bbox or default_bbox
         if box:
-            mask_mode = preset.get("mask_mode", "blur") if preset else "blur"
-            frame = apply_opencv_watermark_removal(frame, box, mask_mode)
+            boxes_to_cover.append(box)
+
+    if title_bbox and len(title_bbox) == 4 and title_bbox not in boxes_to_cover:
+        boxes_to_cover.append(title_bbox)
+
+    if logo_bbox and len(logo_bbox) == 4 and logo_bbox not in boxes_to_cover:
+        boxes_to_cover.append(logo_bbox)
             
-    if not text or not text.strip():
+    if remove_algo != "ffmpeg":
+        for b in boxes_to_cover:
+            frame = apply_opencv_watermark_removal(frame, b, mask_mode, inpainter=inpainter)
+            
+    # Chèn logo thương hiệu (nếu có file logo_path hợp lệ và có vị trí logo_bbox hoặc 1 khung chọn bất kỳ)
+    if logo_path and os.path.exists(logo_path):
+        target_logo_box = None
+        if logo_bbox and len(logo_bbox) == 4:
+            target_logo_box = logo_bbox
+        elif selected_bboxes and len(selected_bboxes) >= 1:
+            target_logo_box = selected_bboxes[-1]
+        elif bbox or default_bbox:
+            target_logo_box = bbox or default_bbox
+            
+        if target_logo_box and len(target_logo_box) == 4:
+            frame = insert_watermark_logo(frame, logo_path, target_logo_box)
+
+    # 1.5. Vẽ tiêu đề video xuyên suốt (nếu có title_text và title_bbox)
+    if title_text and title_bbox and len(title_bbox) == 4:
+        tx, ty, tw, th = title_bbox
+        frame_rgb_t = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img_t = Image.fromarray(frame_rgb_t)
+        draw_t = ImageDraw.Draw(pil_img_t)
+
+        t_font_size = max(24, (preset.get("font_size", 20) + 6) if preset else 26)
+        t_font_path = get_font_path(preset.get("font_name", "Arial") if preset else "Arial")
+        try:
+            t_font = ImageFont.truetype(t_font_path, t_font_size)
+        except Exception:
+            t_font = ImageFont.load_default()
+
+        t_lines = wrap_text(title_text, t_font, max(100, tw))
+        t_w, t_h, _, t_spacing = get_text_block_size(t_lines, t_font)
+
+        t_center_x = tx + (tw / 2.0)
+        t_center_y = ty + (th / 2.0)
+        t_start_y = int(t_center_y - (t_h / 2.0))
+        t_start_y = max(0, min(t_start_y, h_frame - t_h))
+
+        curr_t_y = t_start_y
+        t_font_color = (255, 235, 59) if not preset else tuple(preset.get("font_color", [255, 255, 255]))
+        t_outline_color = (0, 0, 0)
+        t_outline_width = 3
+
+        for t_line in t_lines:
+            line_b = draw_t.textbbox((0, 0), t_line, font=t_font)
+            lw = line_b[2] - line_b[0]
+            lh = line_b[3] - line_b[1]
+            lx = int(t_center_x - (lw / 2.0))
+            lx = max(0, min(lx, w_frame - lw))
+
+            draw_t.text((lx, curr_t_y - line_b[1]), t_line, font=t_font, fill=t_font_color,
+                        stroke_width=t_outline_width, stroke_fill=t_outline_color)
+            curr_t_y += lh + t_spacing
+
+        frame = cv2.cvtColor(np.array(pil_img_t), cv2.COLOR_RGB2BGR)
+            
+    text_clean = (text or "").strip()
+    if not text_clean or any(k in text_clean for k in ("[Chữ khó", "[Gemini]", "[Unreadable]")):
         return frame, False
         
     # 2. Chuẩn bị preset
@@ -560,17 +685,19 @@ def draw_burned_subtitle(frame, text, bbox, default_bbox=None, font_path=None, p
         line_x = max(0, min(line_x, w_frame - line_w))
         
         # Vẽ background box
-        if use_bg_box and bg_opacity > 0:
+        if use_bg_box or (smart_pos and box):
+            actual_opacity = bg_opacity if bg_opacity > 0 else 80
             padding = 6
             box_x1 = max(0, line_x - padding)
             box_y1 = max(0, current_y - padding)
             box_x2 = min(w_frame, line_x + line_w + padding)
             box_y2 = min(h_frame, current_y + line_h + padding)
             
-            if bg_opacity < 255:
+            if actual_opacity < 100:
+                alpha = int(actual_opacity * 255 / 100)
                 overlay = Image.new('RGBA', pil_img.size, (0, 0, 0, 0))
                 overlay_draw = ImageDraw.Draw(overlay)
-                overlay_draw.rectangle([box_x1, box_y1, box_x2, box_y2], fill=bg_color + (bg_opacity,))
+                overlay_draw.rectangle([box_x1, box_y1, box_x2, box_y2], fill=bg_color + (alpha,))
                 pil_img = Image.alpha_composite(pil_img.convert('RGBA'), overlay).convert('RGB')
                 draw = ImageDraw.Draw(pil_img)
             else:
@@ -585,11 +712,45 @@ def draw_burned_subtitle(frame, text, bbox, default_bbox=None, font_path=None, p
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR), overflowed
 
 # Hàm ghi đè phụ đề lên video từng frame
-def process_video_subtitles(video_path, segments, output_temp_video, default_bbox=None, preset=None, progress_callback=None, draw_text=True):
+def preview_subtitle_frame(video_path, subtitle, preset=None, logo_path=None, title_text=None, title_bbox=None, logo_bbox=None):
+    """
+    Trích xuất 1 frame mẫu tại mốc thời gian của subtitle và render đè phụ đề theo preset để xem trước.
+    """
+    if not video_path or not os.path.exists(video_path):
+        return None
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    start_time = subtitle.get("start", 0.0) if isinstance(subtitle, dict) else 0.0
+    target_frame = int(start_time * fps)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret or frame is None:
+        return None
+    text = subtitle.get("text", "") if isinstance(subtitle, dict) else str(subtitle)
+    bbox = subtitle.get("bbox") if isinstance(subtitle, dict) else None
+    rendered_frame, _ = draw_burned_subtitle(
+        frame=frame,
+        text=text,
+        bbox=bbox,
+        preset=preset,
+        logo_path=logo_path,
+        title_text=title_text,
+        title_bbox=title_bbox,
+        logo_bbox=logo_bbox
+    )
+    return rendered_frame
+
+def process_video_subtitles(video_path, segments, output_temp_video, default_bbox=None, preset=None, progress_callback=None, draw_text=True, selected_bboxes=None, logo_path=None, title_text=None, title_bbox=None, logo_bbox=None):
+    from optimized_pipeline import enable_opencv_hardware_acceleration, FFmpegVideoWriter, SmartFrameInpainter
+    enable_opencv_hardware_acceleration()
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError("Khong the mo video de ghi phu de.")
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -597,16 +758,15 @@ def process_video_subtitles(video_path, segments, output_temp_video, default_bbo
         cap.release()
         raise ValueError("Video khong co FPS, kich thuoc hoac so frame hop le.")
     
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_temp_video, fourcc, fps, (width, height))
-    if not out.isOpened():
-        cap.release()
-        raise ValueError("Khong the tao file video tam de ghi phu de.")
-    
+    out = FFmpegVideoWriter(output_temp_video, width, height, fps=fps)
+    inpainter = SmartFrameInpainter(motion_threshold=3.5)
+
     overflowed_segments = []
     sorted_segments = sorted(segments or [], key=lambda s: s.get('start', 0.0))
     seg_idx = 0
     frame_idx = 0
+    rendered_frames_count = 0
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -616,21 +776,27 @@ def process_video_subtitles(video_path, segments, output_temp_video, default_bbo
         
         active_text = None
         active_bbox = None
-        while seg_idx < len(sorted_segments) and sorted_segments[seg_idx].get('end', 0.0) < timestamp_s:
-            seg_idx += 1
-        if seg_idx < len(sorted_segments):
-            seg = sorted_segments[seg_idx]
-            if seg.get('start', 0.0) <= timestamp_s <= seg.get('end', 0.0):
-                active_text = seg.get('text', '').strip()
-                active_bbox = seg.get('bbox')
+        # Tìm chính xác subtitle segment có hiệu lực tại timestamp_s
+        for seg in sorted_segments:
+            s_st = seg.get('start', 0.0)
+            s_et = seg.get('end', 0.0)
+            if s_st <= timestamp_s <= s_et:
+                cand_txt = seg.get('text', '').strip()
+                if cand_txt and not any(k in cand_txt for k in ("[Chữ khó", "[Gemini]", "[Unreadable]")):
+                    active_text = cand_txt
+                    active_bbox = seg.get('bbox')
+                    break
                 
         if active_text:
-            text_to_draw = active_text if draw_text else ""
-            frame, overflowed = draw_burned_subtitle(frame, text_to_draw, active_bbox, default_bbox, preset=preset)
-            if draw_text and overflowed and active_text not in overflowed_segments:
+            is_unreadable = any(k in active_text for k in ("[Chữ khó", "[Gemini]", "[Unreadable]"))
+            text_to_draw = "" if (not draw_text or is_unreadable) else active_text
+            frame, overflowed = draw_burned_subtitle(frame, text_to_draw, active_bbox, default_bbox, preset=preset, selected_bboxes=selected_bboxes, logo_path=logo_path, inpainter=inpainter, title_text=title_text, title_bbox=title_bbox, logo_bbox=logo_bbox)
+            rendered_frames_count += 1
+            if draw_text and overflowed and active_text not in overflowed_segments and not is_unreadable:
                 overflowed_segments.append(active_text)
-        elif default_bbox:
-            frame, _ = draw_burned_subtitle(frame, "", None, default_bbox, preset=preset)
+        elif default_bbox or selected_bboxes or title_bbox or logo_bbox or (logo_path and os.path.exists(logo_path)):
+            frame, _ = draw_burned_subtitle(frame, "", None, default_bbox, preset=preset, selected_bboxes=selected_bboxes, logo_path=logo_path, inpainter=inpainter, title_text=title_text, title_bbox=title_bbox, logo_bbox=logo_bbox)
+            rendered_frames_count += 1
             
         out.write(frame)
         frame_idx += 1
@@ -642,10 +808,11 @@ def process_video_subtitles(video_path, segments, output_temp_video, default_bbo
             
     cap.release()
     out.release()
+    print(f"Số lượng khung hình đã thêm phụ đề: {rendered_frames_count}")
     return overflowed_segments
 
 # Tạo lồng tiếng và trộn video cuối cùng
-def create_dubbed_video(video_path, segments, voice, output_video_path, bg_volume=0.1, dub_volume=1.0, burn_subtitles=False, selected_bbox=None, preset=None, progress_callback=None):
+def create_dubbed_video(video_path, segments, voice, output_video_path, bg_volume=0.1, dub_volume=1.0, burn_subtitles=False, selected_bbox=None, preset=None, progress_callback=None, enable_dubbing=True, selected_bboxes=None, logo_path=None, title_text=None, title_bbox=None, logo_bbox=None):
     """
     Tạo lồng tiếng cho video:
     1. Sinh TTS cho từng câu phụ đề.
@@ -653,71 +820,82 @@ def create_dubbed_video(video_path, segments, voice, output_video_path, bg_volum
     3. Trộn tất cả câu lồng tiếng vào 1 track âm thanh trống.
     4. Trộn track âm thanh mới với video gốc hoặc video đã ghi đè phụ đề sử dụng FFmpeg.
     """
-    temp_dir = os.path.join(os.path.dirname(video_path), "temp_dub")
+    temp_dir = os.path.join(tempfile.gettempdir(), "supersubs_temp_dub")
     os.makedirs(temp_dir, exist_ok=True)
     
-    video_dur_ms = get_video_duration_ms(video_path)
-    if video_dur_ms <= 0:
-        raise ValueError("Không thể lấy độ dài video gốc.")
-        
-    # 1. Khởi tạo track âm thanh lồng tiếng trống bằng pydub
-    dubbed_audio = AudioSegment.silent(duration=video_dur_ms)
-    
-    total_segments = len(segments)
-    
-    for idx, seg in enumerate(segments):
-        start_time = seg['start']
-        end_time = seg['end']
-        sub_dur = end_time - start_time
-        
-        if sub_dur <= 0 or not seg['text'].strip():
-            continue
-            
+    final_dubbed_wav = None
+    if enable_dubbing and segments:
         if progress_callback:
-            progress_callback(f"Đang sinh giọng đọc AI cho câu {idx+1}/{total_segments}...")
-            
-        # Tạo file âm thanh tạm thời
-        raw_audio_path = os.path.join(temp_dir, f"raw_{idx}.mp3")
-        aligned_audio_path = os.path.join(temp_dir, f"aligned_{idx}.mp3")
+            progress_callback("🔊 Đang sinh giọng đọc AI (TTS) cho từng câu phụ đề...")
+        video_dur_ms = get_video_duration_ms(video_path)
+        if video_dur_ms <= 0:
+            try:
+                import cv2
+                cap_d = cv2.VideoCapture(video_path)
+                fps_d = cap_d.get(cv2.CAP_PROP_FPS) or 25.0
+                fcount_d = cap_d.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+                video_dur_ms = int((fcount_d / fps_d) * 1000)
+                cap_d.release()
+            except Exception:
+                video_dur_ms = 60000
+
+        # 1. Khởi tạo track âm thanh lồng tiếng trống bằng pydub
+        dubbed_audio = AudioSegment.silent(duration=max(1000, video_dur_ms))
+        total_segments = len(segments)
         
-        # Sinh giọng đọc
-        success = generate_tts(seg['text'], voice, raw_audio_path)
-        if not success or not os.path.exists(raw_audio_path):
-            continue
+        for idx, seg in enumerate(segments):
+            start_time = seg['start']
+            end_time = seg['end']
+            sub_dur = end_time - start_time
             
-        # Tính toán hệ số tốc độ
-        tts_dur = get_audio_duration(raw_audio_path)
-        if tts_dur <= 0:
-            continue
+            if sub_dur <= 0 or not seg.get('text', '').strip():
+                continue
+                
+            if progress_callback:
+                progress_callback(f"Đang sinh giọng đọc AI cho câu {idx+1}/{total_segments}...")
+                
+            # Tạo file âm thanh tạm thời
+            raw_audio_path = os.path.join(temp_dir, f"raw_{idx}.mp3")
+            aligned_audio_path = os.path.join(temp_dir, f"aligned_{idx}.mp3")
             
-        speed_factor = tts_dur / sub_dur
-        
-        # Căn chỉnh tốc độ đọc nếu tốc độ thực tế dài hơn thời gian phụ đề
-        if speed_factor > 1.05:
-            # Tăng tốc độ đọc lên để vừa khít phân đoạn
-            speed_adjust_audio(raw_audio_path, aligned_audio_path, speed_factor)
-        else:
-            # Giữ nguyên tốc độ đọc tự nhiên nếu câu lồng tiếng ngắn hơn thời gian phụ đề
-            speed_adjust_audio(raw_audio_path, aligned_audio_path, 1.0)
+            # Sinh giọng đọc
+            success = generate_tts(seg['text'], voice, raw_audio_path)
+            if not success or not os.path.exists(raw_audio_path):
+                continue
+                
+            # Tính toán hệ số tốc độ
+            tts_dur = get_audio_duration(raw_audio_path)
+            if tts_dur <= 0:
+                continue
+                
+            speed_factor = tts_dur / sub_dur
             
-        # Ghi đè âm thanh vào track chính theo đúng mốc thời gian (quy đổi ra ms)
-        start_ms = int(start_time * 1000)
-        target_ms = int(sub_dur * 1000)
-        try:
-            aligned_audio = AudioSegment.from_file(aligned_audio_path)
-            # Hard truncate: cắt bớt audio nếu vẫn dài hơn cửa sổ thời gian cho phép
-            if len(aligned_audio) > target_ms:
-                aligned_audio = aligned_audio[:target_ms]
-            # Overlay âm thanh
-            dubbed_audio = dubbed_audio.overlay(aligned_audio, position=start_ms)
-        except Exception as e:
-            print(f"Loi chen am thanh phan doan {idx}: {e}")
-            
-    # Xuất file âm thanh lồng tiếng tổng hợp
-    final_dubbed_wav = os.path.join(temp_dir, "final_dubbed_voice.wav")
-    if progress_callback:
-        progress_callback("Đang xuất file lồng tiếng tổng hợp...")
-    dubbed_audio.export(final_dubbed_wav, format="wav")
+            # Căn chỉnh tốc độ đọc nếu tốc độ thực tế dài hơn thời gian phụ đề
+            if speed_factor > 1.05:
+                speed_adjust_audio(raw_audio_path, aligned_audio_path, speed_factor)
+            else:
+                speed_adjust_audio(raw_audio_path, aligned_audio_path, 1.0)
+                
+            # Ghi đè âm thanh vào track chính theo đúng mốc thời gian (quy đổi ra ms)
+            start_ms = int(start_time * 1000)
+            target_ms = int(sub_dur * 1000)
+            try:
+                aligned_audio = AudioSegment.from_file(aligned_audio_path)
+                if len(aligned_audio) > target_ms:
+                    aligned_audio = aligned_audio[:target_ms]
+                dubbed_audio = dubbed_audio.overlay(aligned_audio, position=start_ms)
+            except Exception as e:
+                print(f"Loi chen am thanh phan doan {idx}: {e}")
+                
+        # Xuất file âm thanh lồng tiếng tổng hợp
+        final_dubbed_wav = os.path.join(temp_dir, "final_dubbed_voice.wav")
+        if progress_callback:
+            progress_callback("Đang xuất file lồng tiếng tổng hợp...")
+        with open(final_dubbed_wav, "wb") as wav_file:
+            dubbed_audio.export(wav_file, format="wav")
+    else:
+        if progress_callback:
+            progress_callback("⏭️ Đã tắt 'Lồng tiếng TTS' (enable_dubbing=False). Giữ nguyên track âm thanh gốc của video.")
     
     # 2. Xử lý video nếu ghi đè phụ đề hoặc cần xóa watermark bằng OpenCV
     video_to_mix = video_path
@@ -726,13 +904,18 @@ def create_dubbed_video(video_path, segments, voice, output_video_path, bg_volum
     remove_algo = preset.get("remove_algo", "opencv") if preset else "opencv"
     smart_pos = preset.get("smart_pos", False) if preset else False
     
-    # Nếu remove_algo == "opencv" và có selected_bbox, ta vẫn chạy OpenCV để xóa watermark.
-    # Nhưng ta sẽ KHÔNG vẽ chữ bằng OpenCV nữa (vì ta sẽ dùng bộ lọc ASS của FFmpeg bên dưới).
-    run_opencv_watermark = (selected_bbox and remove_algo == "opencv")
+    # Kiểm tra xem có bất kỳ đoạn phụ đề nào có bbox riêng (Smart Pos) không
+    has_segment_bbox = any(s.get('bbox') for s in segments)
+    
+    # Chạy OpenCV nếu có selected_bbox, selected_bboxes, chèn logo, segment có bbox, title_bbox, logo_bbox hoặc burn_subtitles
+    run_opencv_watermark = bool(selected_bbox or selected_bboxes or logo_path or has_segment_bbox or title_bbox or logo_bbox or burn_subtitles)
     
     if run_opencv_watermark:
         if progress_callback:
-            progress_callback("Đang thực hiện xử lý ảnh xóa watermark bằng OpenCV...")
+            if burn_subtitles and segments:
+                progress_callback(f"🔥 Đang ghi đè {len(segments)} câu phụ đề tiếng Việt & xử lý xóa watermark bằng OpenCV...")
+            else:
+                progress_callback("Đang thực hiện xử lý ảnh xóa watermark & chèn logo/tiêu đề bằng OpenCV...")
         temp_burned_video = os.path.join(temp_dir, "temp_burned_video.mp4")
         process_video_subtitles(
             video_path=video_path,
@@ -741,41 +924,67 @@ def create_dubbed_video(video_path, segments, voice, output_video_path, bg_volum
             default_bbox=selected_bbox,
             preset=preset,
             progress_callback=progress_callback,
-            draw_text=False  # Chỉ xóa watermark, không vẽ chữ
+            draw_text=burn_subtitles,
+            selected_bboxes=selected_bboxes,
+            logo_path=logo_path,
+            title_text=title_text,
+            title_bbox=title_bbox,
+            logo_bbox=logo_bbox
         )
         video_to_mix = temp_burned_video
         
-    # Tạo tệp phụ đề .ass nếu burn_subtitles là True
-    ass_path = None
-    if burn_subtitles:
-        if progress_callback:
-            progress_callback("Đang sinh tệp phụ đề ASS phục vụ kết xuất video...")
-        ass_path = os.path.join(temp_dir, "subtitles.ass")
-        generate_ass_file(
-            segments=segments,
-            ass_path=ass_path,
-            selected_bbox=selected_bbox,
-            preset=preset,
-            chk_smart_pos=smart_pos,
-            video_path=video_path
-        )
-        
-    # 4. Sử dụng FFmpeg trộn âm thanh lồng tiếng mới vào video
+    # 4. Sử dụng FFmpeg xuất video thành phẩm
     if progress_callback:
-        progress_callback("Đang thực hiện trộn âm thanh và xuất video thành phẩm...")
+        progress_callback("Đang thực hiện kết xuất video thành phẩm...")
         
-    # Xây dựng các bộ lọc video cho FFmpeg
+    # Xây dựng các bộ lọc video cho FFmpeg nếu có
     ffmpeg_vf = []
     use_delogo = (selected_bbox and remove_algo == "ffmpeg")
     if use_delogo:
         x, y, w, h = selected_bbox
         ffmpeg_vf.append(f"delogo=x={x}:y={y}:w={w}:h={h}")
-        
-    if burn_subtitles and ass_path:
-        escaped_ass_path = ass_path.replace("\\", "/").replace(":", "\\:")
-        ffmpeg_vf.append(f"ass='{escaped_ass_path}'")
-        
-    if bg_volume == 0:
+
+    if not enable_dubbing or not final_dubbed_wav or not os.path.exists(final_dubbed_wav):
+        # KHÔNG LỒNG TIẾNG: Kết hợp video với audio gốc
+        if os.path.abspath(video_to_mix) != os.path.abspath(video_path):
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", video_to_mix,
+                "-i", video_path,
+                "-map", "0:v:0",
+                "-map", "1:a?",
+                "-c:v", "copy",
+                "-c:a", "copy",
+                "-movflags", "+faststart",
+                output_video_path
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", video_to_mix,
+                "-c:v", "copy",
+                "-c:a", "copy",
+                "-movflags", "+faststart",
+                output_video_path
+            ]
+        try:
+            _run_ffmpeg(cmd, "Xuat video khong long tieng")
+        except Exception:
+            cmd_fallback = [
+                "ffmpeg", "-y",
+                "-i", video_to_mix,
+                "-i", video_path,
+                "-map", "0:v:0",
+                "-map", "1:a?",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+                output_video_path
+            ]
+            _run_ffmpeg(cmd_fallback, "Xuat video fallback audio")
+    elif bg_volume == 0:
         cmd = [
             "ffmpeg", "-y",
             "-i", video_to_mix,
@@ -799,8 +1008,9 @@ def create_dubbed_video(video_path, segments, voice, output_video_path, bg_volum
             "-shortest",
             output_video_path
         ])
+        _run_ffmpeg(cmd, "Xuat video long tieng bg=0")
     else:
-        # Trộn nhạc nền video gốc (giảm âm lượng) với giọng lồng tiếng (giữ nguyên hoặc tăng âm lượng)
+        # Trộn nhạc nền video gốc (giảm âm lượng) với giọng lồng tiếng
         if ffmpeg_vf:
             cmd = [
                 "ffmpeg", "-y",
@@ -827,9 +1037,12 @@ def create_dubbed_video(video_path, segments, voice, output_video_path, bg_volum
                 "-c:v", "copy",
                 output_video_path
             ]
-        
-    _run_ffmpeg(cmd, "Xuat video long tieng")
+        _run_ffmpeg(cmd, "Xuat video long tieng")
     
+    # Kiểm tra file đầu ra
+    if not os.path.exists(output_video_path) or os.path.getsize(output_video_path) == 0:
+        raise RuntimeError(f"FFmpeg không tạo được file đầu ra: {output_video_path}")
+
     # Dọn dẹp các tệp tạm thời
     try:
         for f in os.listdir(temp_dir):
@@ -877,7 +1090,7 @@ def generate_ass_file(segments, ass_path, selected_bbox, preset, chk_smart_pos=F
     if font_name.endswith(('.ttf', '.otf', '.ttc')) or "/" in font_name or "\\" in font_name:
         font_name = os.path.splitext(os.path.basename(font_name))[0]
 
-    font_size = preset.get("font_size", 20)
+    font_size = int(preset.get("font_size", 20) * 1.5)  # Scale lên 1.5 lần để khớp với preview
     font_color = preset.get("font_color", [255, 255, 255])
     outline_color = preset.get("outline_color", [0, 0, 0])
     outline_width = preset.get("outline_width", 2)
@@ -892,18 +1105,19 @@ def generate_ass_file(segments, ass_path, selected_bbox, preset, chk_smart_pos=F
 
     primary_color = to_ass_color(font_color)
     out_color = to_ass_color(outline_color)
-    back_color = to_ass_color(bg_color, int(bg_opacity * 255 / 100))
+    
+    # Mặc định opacity cho hộp nền
+    actual_bg_opacity = bg_opacity if bg_opacity > 0 else 80
+    back_color = to_ass_color(bg_color, int(actual_bg_opacity * 255 / 100))
 
     # Khi Smart Pos bật, luôn ép BorderStyle=3 (hộp nền đặc) để che chữ gốc
     if chk_smart_pos:
         border_style = 3
-        # Nếu bg_opacity chưa đủ đậm, ép mặc định 80% để hộp nền che kín chữ
-        if bg_opacity <= 0:
-            back_color = to_ass_color(bg_color, int(80 * 255 / 100))
         # Outline = 0 khi dùng hộp nền đặc Smart Pos (tránh viền thừa bao quanh box)
         outline_width = 0
     else:
         border_style = 3 if use_bg_box else 1
+
 
     margin_v_val = preset.get("margin_v_val", 8.0)
     margin_v_type = preset.get("margin_v_type", "percent")
@@ -942,7 +1156,7 @@ def generate_ass_file(segments, ass_path, selected_bbox, preset, chk_smart_pos=F
 
     for seg in segments:
         text = seg.get('text', '').strip()
-        if not text:
+        if not text or any(k in text for k in ("[Chữ khó", "[Gemini]", "[Unreadable]", "[Lỗi")):
             continue
 
         start_t = format_ass_time(seg['start'])

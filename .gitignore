@@ -43,9 +43,24 @@ impeccable/
 .env
 .env.*
 !.env.example
+config/api_keys.json
+!config/api_keys.example.json
+
+# Local runtime data & caches
+config/history.json
+config/batch_history.json
+config/autosave_recovery.json
+config/trans_cache.json
+logs/
+ocr_dataset/
+videos/
+scratch/
+*.backup*
+.agents/skills/ui-ux-pro-max-skill/
 
 # OS/editor
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+

@@ -1,0 +1,61 @@
+{
+  "gemini_model": "gemini-flash-latest (\u2b50 Khuy\u1ebfn ngh\u1ecb - M\u1edbi nh\u1ea5t)",
+  "gemini_auto_fallback_model": true,
+  "gemini_fallback_easyocr": true,
+  "translation_engine": "xKiro AI (\u01afu ti\u00ean)",
+  "prefer_xkiro": true,
+  "dark_mode": true,
+  "workers_cnt": 4,
+  "chunk_workers": 4,
+  "default_workers": 4,
+  "burn_sub": true,
+  "bg_vol": 0.3,
+  "dub_vol": 0.94,
+  "output_dir": "videos",
+  "preset": {
+    "v_align": "bottom",
+    "h_align": "center",
+    "margin_v_type": "pixels",
+    "margin_v_val": 20,
+    "margin_h_type": "pixels",
+    "margin_h_val": 20,
+    "font_name": "Arial",
+    "font_size": 20,
+    "font_color": [
+      255,
+      255,
+      255
+    ],
+    "outline_color": [
+      0,
+      0,
+      0
+    ],
+    "outline_width": 3,
+    "bg_color": [
+      0,
+      0,
+      0
+    ],
+    "bg_opacity": 0,
+    "use_bg_box": false,
+    "mask_mode": "blur",
+    "remove_algo": "ffmpeg",
+    "smart_pos": true
+  },
+  "auto_report": true,
+  "report_format": "HTML",
+  "open_folder_on_done": true,
+  "scan_interval": 0.6,
+  "min_sub_dur": 0.4,
+  "paddle_lang": "Ti\u1ebfng Vi\u1ec7t (vi)",
+  "tts_engine": "Edge-TTS (Microsoft Neural)",
+  "auto_save_voice": true,
+  "voice_fallback": true,
+  "preferred_voice": "vi-VN-HoaiMyNeural",
+  "default_sub_position": "bottom",
+  "window_width": 1100,
+  "window_height": 750,
+  "window_x": 7,
+  "window_y": 0
+}

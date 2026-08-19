@@ -1,0 +1,8 @@
+{
+  "template": "Bạn là chuyên gia dịch thuật phim ảnh. Hãy dịch đoạn văn sau từ {source_lang} sang {target_lang} với các yêu cầu:\n\n1. Giữ nguyên ý nghĩa và ngữ cảnh của câu chuyện\n2. Dịch tự nhiên, không dịch word-by-word, phù hợp với văn nói\n3. Giữ nguyên các thuật ngữ chuyên ngành, tên riêng, địa danh\n4. Đảm bảo độ dài phù hợp với thời lượng hiển thị subtitle (ngắn gọn, súc tích)\n5. Phù hợp với văn phong hội thoại trong phim/video\n\n{context}\n\nĐoạn văn cần dịch:\n{text}",
+  "max_tokens": 1200,
+  "temperature": 0.5,
+  "keep_proper_nouns": true,
+  "auto_context": true,
+  "last_updated": "2026-08-16 22:46:41"
+}

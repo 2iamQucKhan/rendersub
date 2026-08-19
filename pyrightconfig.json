@@ -1,0 +1,24 @@
+{
+  "include": [
+    "."
+  ],
+  "exclude": [
+    "**/__pyrefly_virtual__/**",
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.git",
+    "**/venv",
+    "**/env"
+  ],
+  "reportMissingImports": false,
+  "reportMissingModuleSource": false,
+  "reportAttributeAccessIssue": false,
+  "reportGeneralTypeIssues": false,
+  "reportOptionalMemberAccess": false,
+  "reportOptionalSubscript": false,
+  "reportPrivateImportUsage": false,
+  "reportUnknownMemberType": false,
+  "reportUnknownArgumentType": false,
+  "reportUnknownVariableType": false,
+  "reportAssignmentType": false
+}
