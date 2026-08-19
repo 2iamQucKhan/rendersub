@@ -615,6 +615,10 @@ class TrendingSlangManager:
                 res = res.replace(zh, info.get("vi", ""))
         return res
 
+    def replace_slang(self, text):
+        return self.apply_to_text(text)
+
+
 def get_trending_dict_path():
     return TrendingSlangManager().config_path
 

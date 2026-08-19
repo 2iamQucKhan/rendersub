@@ -145,123 +145,250 @@ class SmartFrameInpainter:
         return frame
 
 
+# --- 3. XÁC THỰC VIDEO ĐẦU RA (OUTPUT VALIDATION) ---
+def validate_output_video(file_path, check_audio=False, min_duration=0.1):
+    """
+    Xác thực toàn diện tệp video đầu ra sau render:
+    1. Kiểm tra tồn tại và kích thước file > 0.
+    2. Mở bằng OpenCV: width > 0, height > 0, fps > 0, frame_count > 0, duration >= min_duration.
+    3. Nếu check_audio=True: kiểm tra stream âm thanh hợp lệ bằng FFprobe hoặc subprocess.
+    Trả về: (True, info_dict) hoặc (False, error_message).
+    """
+    if not file_path or not os.path.exists(file_path):
+        return False, f"File không tồn tại: {file_path}"
+
+    size_bytes = os.path.getsize(file_path)
+    if size_bytes <= 0:
+        return False, f"File video rỗng (0 bytes): {file_path}"
+
+    cap = cv2.VideoCapture(file_path)
+    if not cap.isOpened():
+        return False, f"OpenCV không thể mở file video: {file_path}"
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+
+    if width <= 0 or height <= 0:
+        return False, f"Kích thước video không hợp lệ: {width}x{height}"
+    if fps <= 0:
+        return False, f"FPS không hợp lệ: {fps}"
+    if frame_count <= 0:
+        return False, f"Số frame không hợp lệ: {frame_count}"
+
+    duration_sec = frame_count / fps if fps > 0 else 0.0
+    if duration_sec < min_duration:
+        return False, f"Thời lượng video quá ngắn ({duration_sec:.2f}s < {min_duration}s)"
+
+    has_audio = False
+    if check_audio:
+        try:
+            cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name,duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                file_path
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+            if res.returncode == 0 and res.stdout.strip():
+                has_audio = True
+            else:
+                return False, "Không tìm thấy track âm thanh hợp lệ trong file video."
+        except Exception as e:
+            # Nếu không có ffprobe, thử qua pydub/wave hoặc bỏ qua cảnh báo
+            pass
+
+    info = {
+        "file_path": file_path,
+        "size_bytes": size_bytes,
+        "size_mb": round(size_bytes / (1024 * 1024), 2),
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "frame_count": frame_count,
+        "duration_sec": duration_sec,
+        "has_audio": has_audio
+    }
+    return True, info
+
+
 # --- 3. GHI VIDEO SIÊU TỐC QUA FFMPEG SUBPROCESS (GPU NVENC / CPU ULTRAFAST) ---
+def probe_encoder_support(encoder_name):
+    """Kiểm tra xem hệ thống có hỗ trợ video encoder này hay không bằng ffmpeg test pipe tới null."""
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", "16x16",
+            "-r", "25",
+            "-i", "-",
+            "-c:v", encoder_name,
+            "-frames:v", "1",
+            "-f", "null", "-"
+        ]
+        dummy_frame = np.zeros((16, 16, 3), dtype=np.uint8).tobytes()
+        p = subprocess.run(cmd, input=dummy_frame, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
 class FFmpegVideoWriter:
     """
     Ghi video siêu tốc bằng cách truyền trực tiếp raw BGR bytes vào ống dẫn (stdin pipe) của FFmpeg.
-    Tự động ưu tiên h264_nvenc (NVIDIA GPU Hardware Encoder), fallback sang libx264 (preset ultrafast).
+    Tự động kiểm tra h264_nvenc qua probe, nếu không khả dụng thì fallback sang libx264.
+    ĐẢM BẢO: Không ghi frame dummy nào vào file output thật!
+    Hỗ trợ atomic temp output: ghi vào .tmp.mp4 trước khi validate.
     """
-    def __init__(self, output_path, width, height, fps=25.0, codec="auto"):
-        self.output_path = output_path
+    def __init__(self, output_path, width, height, fps=25.0, codec="auto", atomic=True):
+        self.final_output_path = output_path
+        self.atomic = atomic
+        if self.atomic:
+            out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+            os.makedirs(out_dir, exist_ok=True)
+            base_name = os.path.basename(output_path)
+            self.output_path = os.path.join(out_dir, f".tmp_{int(time.time()*1000)}_{base_name}")
+        else:
+            self.output_path = output_path
+
         self.width = width
         self.height = height
         self.fps = fps
         self.pipe = None
-        self.use_cv2_fallback = False
-        self.cv2_writer = None
+        self.written_frames = 0
+        self.is_closed = False
 
         self._init_ffmpeg(codec)
 
     def _init_ffmpeg(self, codec):
         ffmpeg_bin = "ffmpeg"
         
-        encoders_to_try = []
-        if codec in ("nvenc", "auto"):
-            encoders_to_try.append(["-c:v", "h264_nvenc", "-preset", "p1", "-b:v", "5M"])
-        encoders_to_try.append(["-c:v", "libx264", "-preset", "ultrafast", "-crf", "22"])
+        chosen_encoder = None
+        if codec == "nvenc" or (codec == "auto" and probe_encoder_support("h264_nvenc")):
+            chosen_encoder = ["-c:v", "h264_nvenc", "-preset", "p1", "-b:v", "5M"]
+        else:
+            chosen_encoder = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "22"]
 
-        success = False
-        dummy_bgr = np.zeros((self.height, self.width, 3), dtype=np.uint8).tobytes()
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-s", f"{self.width}x{self.height}",
+            "-pix_fmt", "bgr24",
+            "-r", str(self.fps),
+            "-i", "-"
+        ] + chosen_encoder + [
+            "-pix_fmt", "yuv420p",
+            self.output_path
+        ]
 
-        for enc_args in encoders_to_try:
-            cmd = [
-                ffmpeg_bin, "-y",
-                "-f", "rawvideo",
-                "-vcodec", "rawvideo",
-                "-s", f"{self.width}x{self.height}",
-                "-pix_fmt", "bgr24",
-                "-r", str(self.fps),
-                "-i", "-"
-            ] + enc_args + [
-                "-pix_fmt", "yuv420p",
-                self.output_path
-            ]
-
-            try:
-                p = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                # Ghi thử 1 frame dummy để đảm bảo encoder chấp nhận stream
-                p.stdin.write(dummy_bgr)
-                p.stdin.flush()
-                time.sleep(0.02)
-                if p.poll() is None:
-                    self.pipe = p
-                    success = True
-                    break
-                else:
-                    try: p.kill()
-                    except Exception: pass
-            except Exception:
-                pass
-
-        if not success:
-            self.use_cv2_fallback = True
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.cv2_writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (self.width, self.height))
+        try:
+            self.pipe = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("Không tìm thấy ffmpeg trên hệ thống. Vui lòng cài đặt FFmpeg và cấu hình PATH.") from exc
+        except Exception as exc:
+            raise RuntimeError(f"Lỗi khởi tạo FFmpeg Video Writer: {exc}") from exc
 
     def write(self, frame):
-        if frame is None:
+        if frame is None or self.is_closed:
             return
-        if self.use_cv2_fallback and self.cv2_writer:
-            self.cv2_writer.write(frame)
-        elif self.pipe and self.pipe.stdin:
-            try:
-                self.pipe.stdin.write(frame.tobytes())
-            except Exception:
-                # Nếu pipe bị vỡ, chuyển sang cv2_writer khẩn cấp
-                self.use_cv2_fallback = True
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                self.cv2_writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (self.width, self.height))
-                self.cv2_writer.write(frame)
+        if not self.pipe or not self.pipe.stdin:
+            raise RuntimeError("FFmpeg pipe không ở trạng thái sẵn sàng để ghi.")
+
+        try:
+            self.pipe.stdin.write(frame.tobytes())
+            self.written_frames += 1
+        except Exception as exc:
+            self.is_closed = True
+            err_msg = ""
+            if self.pipe:
+                try:
+                    _, stderr_bytes = self.pipe.communicate(timeout=2)
+                    err_msg = stderr_bytes.decode('utf-8', errors='replace')[-1000:]
+                except Exception:
+                    pass
+            raise RuntimeError(f"Lỗi ghi frame vào FFmpeg pipe (đã ghi {self.written_frames} frames): {exc}\n{err_msg}") from exc
 
     def release(self):
-        if self.use_cv2_fallback and self.cv2_writer:
-            self.cv2_writer.release()
-            self.cv2_writer = None
-        elif self.pipe:
+        if self.is_closed:
+            return
+        self.is_closed = True
+
+        if self.pipe:
             try:
                 if self.pipe.stdin:
+                    try:
+                        self.pipe.stdin.flush()
+                    except Exception:
+                        pass
                     self.pipe.stdin.close()
-                self.pipe.wait(timeout=5)
-            except Exception:
-                try: self.pipe.kill()
-                except Exception: pass
-            self.pipe = None
+                stdout_data, stderr_data = self.pipe.communicate(timeout=30)
+                if self.pipe.returncode != 0:
+                    err_msg = stderr_data.decode('utf-8', errors='replace')[-1000:] if stderr_data else "Unknown error"
+                    raise RuntimeError(f"FFmpeg render thất bại (mã thoát {self.pipe.returncode}):\n{err_msg}")
+            except Exception as e:
+                try:
+                    self.pipe.kill()
+                except Exception:
+                    pass
+                if not isinstance(e, RuntimeError):
+                    raise RuntimeError(f"Lỗi đóng FFmpeg writer: {e}") from e
+                else:
+                    raise
+            finally:
+                self.pipe = None
+
+        # Nếu dùng atomic output: validate file tạm rồi rename sang final_output_path
+        if self.atomic and os.path.exists(self.output_path):
+            valid, info = validate_output_video(self.output_path, check_audio=False)
+            if not valid:
+                try:
+                    os.remove(self.output_path)
+                except Exception:
+                    pass
+                raise RuntimeError(f"Video xuất ra không hợp lệ sau khi render: {info}")
+
+            if os.path.exists(self.final_output_path):
+                try:
+                    os.remove(self.final_output_path)
+                except Exception:
+                    pass
+            shutil.move(self.output_path, self.final_output_path)
 
 
-# --- 4. KIẾN TRÚC PIPELINE ĐA LUỒNG (PRODUCER-CONSUMER PIPELINE) ---
+# --- 4. KIẾN TRÚC PIPELINE ĐA LUỒNG VỚI STRICT FRAME ORDERING ---
 class ParallelVideoProcessor:
     """
-    Quản lý kiến trúc 3 luồng hoạt động song song qua queue:
-    1. ReaderThread: Đọc frame từ VideoCapture nạp vào read_queue.
-    2. WorkerThreads: Thực hiện xử lý frame (Smart Inpaint, Burn Subtitle), nạp vào write_queue.
-    3. WriterThread: Lấy frame từ write_queue ghi vào VideoWriter/FFmpeg pipe.
+    Quản lý kiến trúc đa luồng an toàn:
+    1. ReaderThread: Đọc frame từ VideoCapture nạp vào read_queue (frame_idx, frame).
+    2. WorkerThreads: Xử lý frame (Smart Inpaint, Burn Subtitle), nạp vào write_queue (frame_idx, processed).
+    3. WriterThread: Reorder buffer sắp xếp frame theo đúng thứ tự 0, 1, 2, 3... trước khi ghi ra FFmpegVideoWriter.
+    Bắt lỗi & propagate exception ngay lập tức, không gây deadlock và không nuốt lỗi.
     """
-    def __init__(self, video_path, output_path, process_frame_fn, max_queue_size=64):
+    def __init__(self, video_path, output_path, process_frame_fn, max_queue_size=64, num_workers=2):
         self.video_path = video_path
         self.output_path = output_path
         self.process_frame_fn = process_frame_fn
         self.max_queue_size = max_queue_size
+        self.num_workers = max(1, min(num_workers or 2, os.cpu_count() or 2))
 
         self.read_queue = queue.Queue(maxsize=max_queue_size)
         self.write_queue = queue.Queue(maxsize=max_queue_size)
 
         self.is_running = True
-        self.error_msg = None
+        self.worker_exception = None
+
+    def cancel(self):
+        self.is_running = False
 
     def run(self, progress_callback=None):
         enable_opencv_hardware_acceleration()
@@ -280,65 +407,151 @@ class ParallelVideoProcessor:
         # --- THREAD 1: READ THREAD ---
         def reader_worker():
             frame_idx = 0
-            while self.is_running and cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                self.read_queue.put((frame_idx, frame))
-                frame_idx += 1
-            self.read_queue.put((None, None))  # End signal for reader
-            cap.release()
+            try:
+                while self.is_running and cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    while self.is_running:
+                        try:
+                            self.read_queue.put((frame_idx, frame), timeout=0.2)
+                            frame_idx += 1
+                            break
+                        except queue.Full:
+                            continue
+            except Exception as exc:
+                if not self.worker_exception:
+                    self.worker_exception = exc
+                self.is_running = False
+            finally:
+                cap.release()
+                # Gửi sentinel kết thúc cho tất cả processing workers
+                for _ in range(self.num_workers):
+                    try:
+                        self.read_queue.put((None, None), timeout=2)
+                    except Exception:
+                        pass
 
-        # --- THREAD 2: PROCESS WORKER THREAD ---
-        def process_worker():
+        # --- THREAD 2: PROCESSING WORKER THREAD ---
+        def process_worker(worker_id):
             inpainter = SmartFrameInpainter(motion_threshold=3.5)
-            while self.is_running:
-                try:
-                    f_idx, frame = self.read_queue.get(timeout=2)
+            try:
+                while self.is_running:
+                    try:
+                        f_idx, frame = self.read_queue.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+
                     if f_idx is None:
-                        self.write_queue.put((None, None))
+                        self.read_queue.task_done()
                         break
 
-                    # Gọi hàm xử lý frame người dùng định nghĩa
-                    processed = self.process_frame_fn(frame, f_idx, total_frames, fps, inpainter)
-
-                    self.write_queue.put((f_idx, processed))
-                    self.read_queue.task_done()
-                except queue.Empty:
-                    if not self.is_running:
+                    try:
+                        processed = self.process_frame_fn(frame, f_idx, total_frames, fps, inpainter)
+                        while self.is_running:
+                            try:
+                                self.write_queue.put((f_idx, processed), timeout=0.2)
+                                break
+                            except queue.Full:
+                                continue
+                    except Exception as exc:
+                        if not self.worker_exception:
+                            self.worker_exception = exc
+                        self.is_running = False
                         break
+                    finally:
+                        self.read_queue.task_done()
+            finally:
+                try:
+                    self.write_queue.put((None, None), timeout=1)
+                except Exception:
+                    pass
 
-        # --- THREAD 3: WRITE THREAD ---
+        # --- THREAD 3: WRITE THREAD VỚI STRICT REORDERING BUFFER ---
         def writer_worker():
+            pending_frames = {}
+            next_expected_idx = 0
+            workers_finished = 0
             written_count = 0
-            while self.is_running:
-                try:
-                    f_idx, frame = self.write_queue.get(timeout=2)
-                    if f_idx is None:
-                        break
-                    writer.write(frame)
-                    written_count += 1
-                    if progress_callback and total_frames > 0 and written_count % 15 == 0:
-                        pct = int((written_count / total_frames) * 100)
-                        progress_callback(f"Đang xuất video đa luồng... {pct}% ({written_count}/{total_frames})")
-                    self.write_queue.task_done()
-                except queue.Empty:
-                    if not self.is_running:
-                        break
-            writer.release()
 
-        # Khởi chạy đồng thời 3 threads
+            while (self.is_running or workers_finished < self.num_workers or pending_frames) and not self.worker_exception:
+                try:
+                    f_idx, frame = self.write_queue.get(timeout=0.2)
+                except queue.Empty:
+                    if workers_finished >= self.num_workers and not pending_frames:
+                        break
+                    continue
+
+                if f_idx is None:
+                    workers_finished += 1
+                    self.write_queue.task_done()
+                    if workers_finished >= self.num_workers and not pending_frames:
+                        break
+                    continue
+
+                pending_frames[f_idx] = frame
+                self.write_queue.task_done()
+
+                # Ghi tất cả frame theo đúng thứ tự tăng dần liên tục
+                while next_expected_idx in pending_frames and not self.worker_exception:
+                    frm = pending_frames.pop(next_expected_idx)
+                    try:
+                        writer.write(frm)
+                        written_count += 1
+                        next_expected_idx += 1
+                        if progress_callback and total_frames > 0 and written_count % 15 == 0:
+                            pct = int((written_count / total_frames) * 100)
+                            progress_callback(f"Đang xuất video đa luồng... {pct}% ({written_count}/{total_frames})")
+                    except Exception as exc:
+                        if not self.worker_exception:
+                            self.worker_exception = exc
+                        self.is_running = False
+                        break
+
+            # Dọn dẹp nốt frame còn sót lại nếu có
+            while next_expected_idx in pending_frames and not self.worker_exception:
+                frm = pending_frames.pop(next_expected_idx)
+                try:
+                    writer.write(frm)
+                    written_count += 1
+                    next_expected_idx += 1
+                except Exception as exc:
+                    if not self.worker_exception:
+                        self.worker_exception = exc
+                    break
+
+            try:
+                writer.release()
+            except Exception as exc:
+                if not self.worker_exception:
+                    self.worker_exception = exc
+
+        # Khởi chạy các luồng
         t_read = threading.Thread(target=reader_worker, daemon=True)
-        t_proc = threading.Thread(target=process_worker, daemon=True)
+        worker_threads = [
+            threading.Thread(target=process_worker, args=(wid,), daemon=True)
+            for wid in range(self.num_workers)
+        ]
         t_write = threading.Thread(target=writer_worker, daemon=True)
 
         t_read.start()
-        t_proc.start()
+        for tw in worker_threads:
+            tw.start()
         t_write.start()
 
         t_read.join()
-        t_proc.join()
+        for tw in worker_threads:
+            tw.join()
         t_write.join()
+
+        if self.worker_exception:
+            # Nếu có lỗi, dọn dẹp file output chưa hoàn thiện và ném lỗi ra ngoài
+            if os.path.exists(self.output_path):
+                try:
+                    os.remove(self.output_path)
+                except Exception:
+                    pass
+            raise self.worker_exception
 
         return True
 
@@ -860,5 +1073,228 @@ class StreamingLongVideoProcessor:
             'total_time': total_time,
             'total_chunks': chunk_idx
         }
+
+
+# --- 10. PIPELINE STATE MACHINE & UNIFIED EXECUTION ENGINE ---
+
+class PipelineState:
+    QUEUED = "QUEUED"
+    VALIDATING = "VALIDATING"
+    DOWNLOADING = "DOWNLOADING"
+    OCR = "OCR"
+    TRANSLATING = "TRANSLATING"
+    TTS = "TTS"
+    AUDIO_SYNC = "AUDIO_SYNC"
+    RENDERING = "RENDERING"
+    VALIDATING_OUTPUT = "VALIDATING_OUTPUT"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+def execute_single_video_pipeline(video_path, output_path, config=None, progress_callback=None, cancel_check_fn=None, state_callback=None):
+    """
+    Thực thi toàn bộ pipeline xử lý video end-to-end (dùng chung cho cả 1-Click GUI và Batch Queue).
+    Tuyệt đối không dùng giả lập (fake progress / sleep).
+    Output chỉ thành công khi vượt qua xác thực validate_output_video().
+    """
+    if config is None:
+        config = {}
+
+    start_time = time.time()
+
+    def update_state(state, progress_pct, msg):
+        if state_callback:
+            state_callback(state, progress_pct, msg)
+        if progress_callback:
+            progress_callback(f"[{progress_pct}%] [{state}] {msg}")
+
+    # BƯỚC 1: XÁC THỰC INPUT VIDEO
+    update_state(PipelineState.VALIDATING, 5, "Đang kiểm tra tính hợp lệ của video đầu vào...")
+    if cancel_check_fn and cancel_check_fn():
+        raise InterruptedError("Tiến trình bị hủy bởi người dùng.")
+
+    valid_in, in_info = validate_output_video(video_path, check_audio=False, min_duration=0.1)
+    if not valid_in:
+        raise ValueError(f"Video đầu vào không hợp lệ: {in_info}")
+
+    out_dir = os.path.dirname(os.path.abspath(output_path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    # Đọc cấu hình pipeline
+    raw_ocr = str(config.get("ocr_engine", "gemini")).lower()
+    if "paddle" in raw_ocr:
+        ocr_engine = "paddleocr"
+    elif "xkiro" in raw_ocr:
+        ocr_engine = "xkiro"
+    elif "easyocr" in raw_ocr or "offline" in raw_ocr:
+        ocr_engine = "easyocr"
+    else:
+        ocr_engine = "gemini"
+
+    source_lang = config.get("source_lang", "auto")
+    target_lang = config.get("target_lang", "vi")
+    api_key = config.get("api_key", "")
+    xkiro_key = config.get("xkiro_key", "")
+    engine = config.get("engine", "xKiro AI")
+    voice = config.get("voice", "vi-VN-HoaiMyNeural")
+    bg_vol = float(config.get("bg_vol", 0.1))
+    dub_vol = float(config.get("dub_vol", 1.0))
+    burn_sub = bool(config.get("burn_sub", True) if "burn_sub" in config else config.get("burn_subtitles", True))
+    enable_dubbing = bool(config.get("enable_dubbing", True))
+    preset = config.get("preset", None)
+    selected_bbox = config.get("selected_bbox", None)
+    selected_bboxes = config.get("selected_bboxes", None)
+    logo_path = config.get("logo_path", None)
+    logo_bbox = config.get("logo_bbox", None)
+    title_bbox = config.get("title_bbox", None)
+    chunk_workers = int(config.get("chunk_workers", 2) or 2)
+    scan_interval = float(config.get("scan_interval", 0.5) or 0.5)
+
+    # BƯỚC 2: OCR / TRÍCH XUẤT PHỤ ĐỀ
+    update_state(PipelineState.OCR, 15, f"Bắt đầu quét phụ đề bằng OCR ({ocr_engine.upper()})...")
+    if cancel_check_fn and cancel_check_fn():
+        raise InterruptedError("Tiến trình bị hủy bởi người dùng.")
+
+    segments = []
+    if ocr_engine == "gemini":
+        try:
+            from gemini_vision_ocr import load_gemini_keys, scan_video_frames_with_gemini
+            keys_list = [k.strip() for k in api_key.split(",") if k.strip()] if api_key else load_gemini_keys()
+            if keys_list:
+                vision_segs = scan_video_frames_with_gemini(
+                    video_path=video_path,
+                    sample_interval_sec=scan_interval,
+                    api_keys=keys_list,
+                    progress_callback=lambda m: progress_callback(m) if progress_callback else None
+                )
+                if vision_segs:
+                    segments = vision_segs
+        except Exception as e:
+            if progress_callback:
+                progress_callback(f"⚠️ Gemini OCR thất bại ({e}), chuyển sang quét OCR phân đoạn...")
+
+    if not segments:
+        if cancel_check_fn and cancel_check_fn():
+            raise InterruptedError("Tiến trình bị hủy bởi người dùng.")
+        ocr_boxes = selected_bboxes or ([selected_bbox] if selected_bbox else [])
+        processor = ParallelChunkOCRProcessor(video_path, max_workers=chunk_workers)
+        res_ocr = processor.process_video_ocr(
+            bboxes=ocr_boxes,
+            ocr_lang=source_lang,
+            api_key=api_key,
+            progress_callback=lambda m: progress_callback(m) if progress_callback else None,
+            check_cancel_func=cancel_check_fn,
+            ocr_engine=ocr_engine
+        )
+        segments = res_ocr.get("subtitles", [])
+
+    # Chuẩn hóa schema dữ liệu subtitle segments
+    clean_segments = []
+    for s in (segments or []):
+        txt = str(s.get("text", "")).strip()
+        if not txt:
+            continue
+        clean_segments.append({
+            "text": txt,
+            "bbox": s.get("bbox", None),
+            "start": float(s.get("start", 0.0)),
+            "end": float(s.get("end", 0.0)),
+            "confidence": float(s.get("confidence", 1.0))
+        })
+    segments = clean_segments
+
+    update_state(PipelineState.OCR, 35, f"Quét OCR hoàn tất: tìm thấy {len(segments)} câu phụ đề.")
+
+    if cancel_check_fn and cancel_check_fn():
+        raise InterruptedError("Tiến trình bị hủy bởi người dùng.")
+
+    # BƯỚC 3: DỊCH THUẬT PHỤ ĐỀ (TRANSLATION)
+    if segments:
+        update_state(PipelineState.TRANSLATING, 40, f"Đang dịch thuật {len(segments)} câu phụ đề ({engine})...")
+        import translator
+        translated_segs = translator.translate_segments(
+            segments,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            engine=engine,
+            api_key=api_key,
+            progress_callback=lambda m: progress_callback(m) if progress_callback else None,
+            xkiro_key=xkiro_key
+        )
+        if translated_segs:
+            segments = translated_segs
+        update_state(PipelineState.TRANSLATING, 60, f"Dịch thuật hoàn tất {len(segments)} câu.")
+
+    if cancel_check_fn and cancel_check_fn():
+        raise InterruptedError("Tiến trình bị hủy bởi người dùng.")
+
+    # BƯỚC 4 & 5: TTS, AUDIO SYNC, SUBTITLE INPAINT & RENDER
+    update_state(PipelineState.RENDERING, 70, "Đang tổng hợp âm thanh & render video thành phẩm...")
+    import dubber
+
+    translated_title_text = None
+    if title_bbox and len(title_bbox) == 4:
+        try:
+            from deep_translator import GoogleTranslator
+            gt = GoogleTranslator(source="auto", target=target_lang)
+            # Dịch tiêu đề nếu có
+        except Exception:
+            pass
+
+    out_temp = f"{output_path}.tmp.mp4"
+    res_path, overflowed = dubber.create_dubbed_video(
+        video_path=video_path,
+        segments=segments,
+        voice=voice,
+        output_video_path=out_temp,
+        bg_volume=bg_vol,
+        dub_volume=dub_vol,
+        burn_subtitles=burn_sub,
+        selected_bbox=selected_bbox,
+        preset=preset,
+        progress_callback=lambda m: progress_callback(m) if progress_callback else None,
+        enable_dubbing=enable_dubbing,
+        selected_bboxes=selected_bboxes,
+        logo_path=logo_path,
+        title_text=translated_title_text,
+        title_bbox=title_bbox,
+        logo_bbox=logo_bbox
+    )
+
+    if cancel_check_fn and cancel_check_fn():
+        if os.path.exists(out_temp):
+            try: os.remove(out_temp)
+            except Exception: pass
+        raise InterruptedError("Tiến trình bị hủy bởi người dùng.")
+
+    # BƯỚC 6: XÁC THỰC KẾT QUẢ ĐẦU RA (VALIDATING OUTPUT)
+    update_state(PipelineState.VALIDATING_OUTPUT, 95, "Đang kiểm tra chất lượng file video đầu ra...")
+    valid_out, out_info = validate_output_video(out_temp, check_audio=False, min_duration=0.1)
+    if not valid_out:
+        if os.path.exists(out_temp):
+            try: os.remove(out_temp)
+            except Exception: pass
+        raise RuntimeError(f"Video đầu ra không hợp lệ sau khi render: {out_info}")
+
+    # Atomic rename sang output_path chính thức
+    if os.path.exists(output_path):
+        try: os.remove(output_path)
+        except Exception: pass
+    shutil.move(out_temp, output_path)
+
+    elapsed = time.time() - start_time
+    size_mb = round(os.path.getsize(output_path) / (1024 * 1024), 2)
+    update_state(PipelineState.COMPLETED, 100, f"Hoàn thành xuất sắc trong {elapsed:.1f}s ({size_mb} MB)!")
+
+    return {
+        "output_path": output_path,
+        "elapsed_sec": elapsed,
+        "size_mb": size_mb,
+        "segments_count": len(segments),
+        "info": out_info
+    }
+
 
 

@@ -9,11 +9,11 @@
   "chunk_workers": 4,
   "default_workers": 4,
   "burn_sub": true,
-  "bg_vol": 0.3,
-  "dub_vol": 0.94,
+  "bg_vol": 0.15,
+  "dub_vol": 1.0,
   "output_dir": "videos",
   "preset": {
-    "v_align": "bottom",
+    "v_align": "top",
     "h_align": "center",
     "margin_v_type": "pixels",
     "margin_v_val": 20,
@@ -53,9 +53,9 @@
   "auto_save_voice": true,
   "voice_fallback": true,
   "preferred_voice": "vi-VN-HoaiMyNeural",
-  "default_sub_position": "bottom",
+  "default_sub_position": "top",
   "window_width": 1100,
   "window_height": 750,
-  "window_x": 7,
+  "window_x": 0,
   "window_y": 0
 }

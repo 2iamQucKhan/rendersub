@@ -18,6 +18,7 @@ import cv2
 import winsound
 import time
 import json
+import threading
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 from PyQt6.QtWidgets import (
@@ -72,26 +73,55 @@ class BatchPipelineWorker(QThread):
         self.video_queue = video_queue
         self.base_config = base_config
         self.stop_on_error = stop_on_error
-        self.max_workers = max_workers
+        self.max_workers = max(1, min(int(max_workers or 2), 8))
         self._is_cancelled = False
+        self._executor = None
+        self._lock = threading.Lock()
 
     def cancel(self):
         self._is_cancelled = True
+        if self._executor:
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
     def run(self):
+        import concurrent.futures
+        from optimized_pipeline import execute_single_video_pipeline, validate_output_video
+
         total = len(self.video_queue)
-        completed = 0
+        if total == 0:
+            summary = {
+                "total": 0, "completed": 0, "success": 0, "failed": 0,
+                "total_time_str": "00:00:00", "total_time_sec": 0.0,
+                "results": [], "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            self.sig_batch_finished.emit(summary)
+            return
+
+        completed_cnt = 0
         success_cnt = 0
         failed_cnt = 0
         total_start_time = time.time()
-        results = []
+        results_map = {}
 
-        self.sig_log.emit("INFO", f"🚀 Bắt đầu xử lý hàng loạt {total} video (Workers: {self.max_workers})...")
+        actual_workers = min(self.max_workers, total)
+        self.sig_log.emit("INFO", f"🚀 Bắt đầu xử lý hàng loạt {total} video (Chạy song song: {actual_workers} workers)...")
 
-        for item in self.video_queue:
+        def process_item(item):
+            nonlocal completed_cnt, success_cnt, failed_cnt
+
             if self._is_cancelled:
-                self.sig_log.emit("WARNING", "🛑 Tiến trình Batch đã bị người dùng hủy dừng.")
-                break
+                return {
+                    "name": os.path.basename(item["file_path"]),
+                    "path": item["file_path"],
+                    "output": "",
+                    "status": "cancelled",
+                    "time_sec": 0.0,
+                    "size_mb": 0.0,
+                    "error": "Cancelled by user"
+                }
 
             idx = item["index"]
             vpath = item["file_path"]
@@ -99,67 +129,101 @@ class BatchPipelineWorker(QThread):
             cfg = item.get("config", self.base_config)
 
             self.sig_item_started.emit(idx, vname)
-            self.sig_log.emit("INFO", f"▶ [Video {idx+1}/{total}] Đang xử lý: {vname}")
+            self.sig_log.emit("INFO", f"▶ [Video #{idx+1}/{total}] Bắt đầu xử lý: {vname}")
 
             item_start = time.time()
-            out_path = ""
-            err_msg = ""
-            size_mb = 0.0
+            out_dir = cfg.get("output_dir", "videos")
+            os.makedirs(out_dir, exist_ok=True)
+            base_stem, ext = os.path.splitext(vname)
+            out_path = os.path.join(out_dir, f"{base_stem}_dubbed{ext if ext else '.mp4'}")
+
+            def item_progress_cb(msg):
+                pct = 50
+                if "[" in msg and "%]" in msg:
+                    try:
+                        p_str = msg.split("[")[1].split("%]")[0].strip()
+                        pct = int(p_str)
+                    except Exception:
+                        pass
+                self.sig_item_progress.emit(idx, pct, msg)
 
             try:
-                self.sig_item_progress.emit(idx, 20, "🔍 Đang trích xuất & OCR phụ đề...")
-                time.sleep(0.4)
-                if self._is_cancelled: break
-
-                self.sig_item_progress.emit(idx, 50, "🌐 Đang dịch thuật AI...")
-                time.sleep(0.4)
-                if self._is_cancelled: break
-
-                self.sig_item_progress.emit(idx, 75, "🎙️ Đang tổng hợp giọng nói AI (TTS)...")
-                time.sleep(0.4)
-                if self._is_cancelled: break
-
-                self.sig_item_progress.emit(idx, 95, "🎬 Đang ghép phụ đề và render video...")
-                time.sleep(0.3)
-
-                out_dir = cfg.get("output_dir", "videos")
-                os.makedirs(out_dir, exist_ok=True)
-                base_stem, ext = os.path.splitext(vname)
-                out_path = os.path.join(out_dir, f"{base_stem}_dubbed{ext if ext else '.mp4'}")
-                
-                if os.path.exists(out_path):
-                    size_mb = round(os.path.getsize(out_path) / (1024 * 1024), 2)
-                else:
-                    if os.path.exists(vpath):
-                        size_mb = round(os.path.getsize(vpath) / (1024 * 1024), 2)
-                    else:
-                        size_mb = 12.5
+                # Thực thi pipeline thực tế
+                res_dict = execute_single_video_pipeline(
+                    video_path=vpath,
+                    output_path=out_path,
+                    config=cfg,
+                    progress_callback=item_progress_cb,
+                    cancel_check_fn=lambda: self._is_cancelled
+                )
 
                 elapsed = time.time() - item_start
+                size_mb = res_dict.get("size_mb", 0.0)
+
+                with self._lock:
+                    success_cnt += 1
+                    completed_cnt += 1
+                    cur_completed = completed_cnt
+
                 self.sig_item_finished.emit(idx, True, out_path, elapsed, size_mb, "")
-                self.sig_log.emit("SUCCESS", f"✔ [Video {idx+1}/{total}] Hoàn thành: {vname} ({elapsed:.1f}s, {size_mb:.1f}MB)")
-                success_cnt += 1
-                results.append({"name": vname, "path": vpath, "output": out_path, "status": "success", "time_sec": elapsed, "size_mb": size_mb, "error": ""})
+                self.sig_log.emit("SUCCESS", f"✔ [Video #{idx+1}/{total}] Hoàn thành: {vname} ({elapsed:.1f}s, {size_mb:.1f}MB)")
 
-            except Exception as e:
-                err_msg = str(e)
+                res_info = {"name": vname, "path": vpath, "output": out_path, "status": "success", "time_sec": elapsed, "size_mb": size_mb, "error": ""}
+
+            except Exception as exc:
                 elapsed = time.time() - item_start
-                self.sig_item_finished.emit(idx, False, "", elapsed, 0.0, err_msg)
-                self.sig_log.emit("ERROR", f"✖ [Video {idx+1}/{total}] Thất bại: {vname} - {err_msg}")
-                failed_cnt += 1
-                results.append({"name": vname, "path": vpath, "output": "", "status": "failed", "time_sec": elapsed, "size_mb": 0.0, "error": err_msg})
-                if self.stop_on_error:
-                    self.sig_log.emit("ERROR", "⛔ Đã dừng Batch do tùy chọn 'Dừng khi có lỗi' đang bật.")
-                    break
+                err_msg = str(exc)
+                if self._is_cancelled:
+                    err_msg = "Tiến trình đã bị người dùng hủy dừng."
 
-            completed += 1
+                with self._lock:
+                    failed_cnt += 1
+                    completed_cnt += 1
+                    cur_completed = completed_cnt
+
+                self.sig_item_finished.emit(idx, False, "", elapsed, 0.0, err_msg)
+                self.sig_log.emit("ERROR", f"✖ [Video #{idx+1}/{total}] Thất bại: {vname} - {err_msg}")
+
+                res_info = {"name": vname, "path": vpath, "output": "", "status": "failed", "time_sec": elapsed, "size_mb": 0.0, "error": err_msg}
+
+                if self.stop_on_error and not self._is_cancelled:
+                    self._is_cancelled = True
+                    self.sig_log.emit("ERROR", "⛔ Đã dừng Batch do tùy chọn 'Dừng khi có lỗi' đang bật.")
+
+            # Cập nhật tiến độ tổng thể của Batch
             tot_elapsed = time.time() - total_start_time
-            avg_per_item = tot_elapsed / max(1, completed)
-            rem_items = total - completed
+            avg_per_item = tot_elapsed / max(1, cur_completed)
+            rem_items = max(0, total - cur_completed)
             rem_sec = int(avg_per_item * rem_items)
             m, s = divmod(rem_sec, 60)
             eta_str = f"{m:02d}:{s:02d}"
-            self.sig_batch_progress.emit(completed, total, eta_str)
+            self.sig_batch_progress.emit(cur_completed, total, eta_str)
+
+            return res_info
+
+        # Thực thi qua ThreadPoolExecutor thực thụ với max_workers
+        with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            self._executor = executor
+            future_to_idx = {
+                executor.submit(process_item, item): item["index"]
+                for item in self.video_queue
+            }
+
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    res_obj = future.result()
+                    results_map[idx] = res_obj
+                except Exception as e:
+                    results_map[idx] = {
+                        "name": f"Video #{idx}",
+                        "path": "",
+                        "output": "",
+                        "status": "failed",
+                        "time_sec": 0.0,
+                        "size_mb": 0.0,
+                        "error": str(e)
+                    }
 
         total_elapsed_sec = time.time() - total_start_time
         tot_h = int(total_elapsed_sec // 3600)
@@ -167,18 +231,24 @@ class BatchPipelineWorker(QThread):
         tot_s = int(total_elapsed_sec % 60)
         total_time_str = f"{tot_h:02d}:{tot_m:02d}:{tot_s:02d}"
 
+        # Sắp xếp kết quả theo đúng index ban đầu
+        ordered_results = [results_map.get(i, {}) for i in range(total)]
+
         summary = {
             "total": total,
-            "completed": completed,
+            "completed": completed_cnt,
             "success": success_cnt,
             "failed": failed_cnt,
             "total_time_str": total_time_str,
             "total_time_sec": total_elapsed_sec,
-            "results": results,
+            "results": ordered_results,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
         self.sig_batch_finished.emit(summary)
-        self.sig_log.emit("SUCCESS", f"🎉 Hoàn thành Batch: {success_cnt}/{total} thành công trong {total_time_str}!")
+        if self._is_cancelled:
+            self.sig_log.emit("WARNING", f"🛑 Đã kết thúc Batch (Đã dừng): {success_cnt}/{total} thành công trong {total_time_str}")
+        else:
+            self.sig_log.emit("SUCCESS", f"🎉 Hoàn thành Batch: {success_cnt}/{total} thành công trong {total_time_str}!")
 
 def global_exception_handler(exc_type, exc_value, exc_traceback):
     import traceback

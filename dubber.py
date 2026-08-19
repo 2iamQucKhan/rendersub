@@ -820,238 +820,257 @@ def create_dubbed_video(video_path, segments, voice, output_video_path, bg_volum
     3. Trộn tất cả câu lồng tiếng vào 1 track âm thanh trống.
     4. Trộn track âm thanh mới với video gốc hoặc video đã ghi đè phụ đề sử dụng FFmpeg.
     """
-    temp_dir = os.path.join(tempfile.gettempdir(), "supersubs_temp_dub")
+    import time
+    unique_tag = f"{int(time.time() * 1000)}_{os.getpid()}"
+    temp_dir = os.path.join(tempfile.gettempdir(), f"supersubs_dub_{unique_tag}")
     os.makedirs(temp_dir, exist_ok=True)
     
-    final_dubbed_wav = None
-    if enable_dubbing and segments:
-        if progress_callback:
-            progress_callback("🔊 Đang sinh giọng đọc AI (TTS) cho từng câu phụ đề...")
-        video_dur_ms = get_video_duration_ms(video_path)
-        if video_dur_ms <= 0:
-            try:
-                import cv2
-                cap_d = cv2.VideoCapture(video_path)
-                fps_d = cap_d.get(cv2.CAP_PROP_FPS) or 25.0
-                fcount_d = cap_d.get(cv2.CAP_PROP_FRAME_COUNT) or 0
-                video_dur_ms = int((fcount_d / fps_d) * 1000)
-                cap_d.release()
-            except Exception:
-                video_dur_ms = 60000
+    out_dir = os.path.dirname(os.path.abspath(output_video_path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    out_tmp_video = os.path.join(out_dir, f".tmp_{unique_tag}_{os.path.basename(output_video_path)}")
 
-        # 1. Khởi tạo track âm thanh lồng tiếng trống bằng pydub
-        dubbed_audio = AudioSegment.silent(duration=max(1000, video_dur_ms))
-        total_segments = len(segments)
-        
-        for idx, seg in enumerate(segments):
-            start_time = seg['start']
-            end_time = seg['end']
-            sub_dur = end_time - start_time
-            
-            if sub_dur <= 0 or not seg.get('text', '').strip():
-                continue
-                
-            if progress_callback:
-                progress_callback(f"Đang sinh giọng đọc AI cho câu {idx+1}/{total_segments}...")
-                
-            # Tạo file âm thanh tạm thời
-            raw_audio_path = os.path.join(temp_dir, f"raw_{idx}.mp3")
-            aligned_audio_path = os.path.join(temp_dir, f"aligned_{idx}.mp3")
-            
-            # Sinh giọng đọc
-            success = generate_tts(seg['text'], voice, raw_audio_path)
-            if not success or not os.path.exists(raw_audio_path):
-                continue
-                
-            # Tính toán hệ số tốc độ
-            tts_dur = get_audio_duration(raw_audio_path)
-            if tts_dur <= 0:
-                continue
-                
-            speed_factor = tts_dur / sub_dur
-            
-            # Căn chỉnh tốc độ đọc nếu tốc độ thực tế dài hơn thời gian phụ đề
-            if speed_factor > 1.05:
-                speed_adjust_audio(raw_audio_path, aligned_audio_path, speed_factor)
-            else:
-                speed_adjust_audio(raw_audio_path, aligned_audio_path, 1.0)
-                
-            # Ghi đè âm thanh vào track chính theo đúng mốc thời gian (quy đổi ra ms)
-            start_ms = int(start_time * 1000)
-            target_ms = int(sub_dur * 1000)
-            try:
-                aligned_audio = AudioSegment.from_file(aligned_audio_path)
-                if len(aligned_audio) > target_ms:
-                    aligned_audio = aligned_audio[:target_ms]
-                dubbed_audio = dubbed_audio.overlay(aligned_audio, position=start_ms)
-            except Exception as e:
-                print(f"Loi chen am thanh phan doan {idx}: {e}")
-                
-        # Xuất file âm thanh lồng tiếng tổng hợp
-        final_dubbed_wav = os.path.join(temp_dir, "final_dubbed_voice.wav")
-        if progress_callback:
-            progress_callback("Đang xuất file lồng tiếng tổng hợp...")
-        with open(final_dubbed_wav, "wb") as wav_file:
-            dubbed_audio.export(wav_file, format="wav")
-    else:
-        if progress_callback:
-            progress_callback("⏭️ Đã tắt 'Lồng tiếng TTS' (enable_dubbing=False). Giữ nguyên track âm thanh gốc của video.")
-    
-    # 2. Xử lý video nếu ghi đè phụ đề hoặc cần xóa watermark bằng OpenCV
-    video_to_mix = video_path
-    overflowed_segments = []
-    
-    remove_algo = preset.get("remove_algo", "opencv") if preset else "opencv"
-    smart_pos = preset.get("smart_pos", False) if preset else False
-    
-    # Kiểm tra xem có bất kỳ đoạn phụ đề nào có bbox riêng (Smart Pos) không
-    has_segment_bbox = any(s.get('bbox') for s in segments)
-    
-    # Chạy OpenCV nếu có selected_bbox, selected_bboxes, chèn logo, segment có bbox, title_bbox, logo_bbox hoặc burn_subtitles
-    run_opencv_watermark = bool(selected_bbox or selected_bboxes or logo_path or has_segment_bbox or title_bbox or logo_bbox or burn_subtitles)
-    
-    if run_opencv_watermark:
-        if progress_callback:
-            if burn_subtitles and segments:
-                progress_callback(f"🔥 Đang ghi đè {len(segments)} câu phụ đề tiếng Việt & xử lý xóa watermark bằng OpenCV...")
-            else:
-                progress_callback("Đang thực hiện xử lý ảnh xóa watermark & chèn logo/tiêu đề bằng OpenCV...")
-        temp_burned_video = os.path.join(temp_dir, "temp_burned_video.mp4")
-        process_video_subtitles(
-            video_path=video_path,
-            segments=segments,
-            output_temp_video=temp_burned_video,
-            default_bbox=selected_bbox,
-            preset=preset,
-            progress_callback=progress_callback,
-            draw_text=burn_subtitles,
-            selected_bboxes=selected_bboxes,
-            logo_path=logo_path,
-            title_text=title_text,
-            title_bbox=title_bbox,
-            logo_bbox=logo_bbox
-        )
-        video_to_mix = temp_burned_video
-        
-    # 4. Sử dụng FFmpeg xuất video thành phẩm
-    if progress_callback:
-        progress_callback("Đang thực hiện kết xuất video thành phẩm...")
-        
-    # Xây dựng các bộ lọc video cho FFmpeg nếu có
-    ffmpeg_vf = []
-    use_delogo = (selected_bbox and remove_algo == "ffmpeg")
-    if use_delogo:
-        x, y, w, h = selected_bbox
-        ffmpeg_vf.append(f"delogo=x={x}:y={y}:w={w}:h={h}")
-
-    if not enable_dubbing or not final_dubbed_wav or not os.path.exists(final_dubbed_wav):
-        # KHÔNG LỒNG TIẾNG: Kết hợp video với audio gốc
-        if os.path.abspath(video_to_mix) != os.path.abspath(video_path):
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", video_to_mix,
-                "-i", video_path,
-                "-map", "0:v:0",
-                "-map", "1:a?",
-                "-c:v", "copy",
-                "-c:a", "copy",
-                "-movflags", "+faststart",
-                output_video_path
-            ]
-        else:
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", video_to_mix,
-                "-c:v", "copy",
-                "-c:a", "copy",
-                "-movflags", "+faststart",
-                output_video_path
-            ]
-        try:
-            _run_ffmpeg(cmd, "Xuat video khong long tieng")
-        except Exception:
-            cmd_fallback = [
-                "ffmpeg", "-y",
-                "-i", video_to_mix,
-                "-i", video_path,
-                "-map", "0:v:0",
-                "-map", "1:a?",
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-movflags", "+faststart",
-                output_video_path
-            ]
-            _run_ffmpeg(cmd_fallback, "Xuat video fallback audio")
-    elif bg_volume == 0:
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", video_to_mix,
-            "-i", final_dubbed_wav,
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-filter:a:1", f"volume={dub_volume}"
-        ]
-        if ffmpeg_vf:
-            cmd.extend([
-                "-vf", ",".join(ffmpeg_vf),
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "23"
-            ])
-        else:
-            cmd.extend([
-                "-c:v", "copy"
-            ])
-        cmd.extend([
-            "-shortest",
-            output_video_path
-        ])
-        _run_ffmpeg(cmd, "Xuat video long tieng bg=0")
-    else:
-        # Trộn nhạc nền video gốc (giảm âm lượng) với giọng lồng tiếng
-        if ffmpeg_vf:
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", video_to_mix,
-                "-i", final_dubbed_wav,
-                "-i", video_path,
-                "-filter_complex", f"[0:v]{','.join(ffmpeg_vf)}[v_filtered];[2:a]volume={bg_volume}[bg];[1:a]volume={dub_volume}[fg];[bg][fg]amix=inputs=2:duration=first[a]",
-                "-map", "[v_filtered]",
-                "-map", "[a]",
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "23",
-                output_video_path
-            ]
-        else:
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", video_to_mix,
-                "-i", final_dubbed_wav,
-                "-i", video_path,
-                "-filter_complex", f"[2:a]volume={bg_volume}[bg];[1:a]volume={dub_volume}[fg];[bg][fg]amix=inputs=2:duration=first[a]",
-                "-map", "0:v:0",
-                "-map", "[a]",
-                "-c:v", "copy",
-                output_video_path
-            ]
-        _run_ffmpeg(cmd, "Xuat video long tieng")
-    
-    # Kiểm tra file đầu ra
-    if not os.path.exists(output_video_path) or os.path.getsize(output_video_path) == 0:
-        raise RuntimeError(f"FFmpeg không tạo được file đầu ra: {output_video_path}")
-
-    # Dọn dẹp các tệp tạm thời
     try:
-        for f in os.listdir(temp_dir):
-            os.remove(os.path.join(temp_dir, f))
-        os.rmdir(temp_dir)
-    except Exception:
-        pass
+        final_dubbed_wav = None
+        if enable_dubbing and segments:
+            if progress_callback:
+                progress_callback("🔊 Đang sinh giọng đọc AI (TTS) cho từng câu phụ đề...")
+            video_dur_ms = get_video_duration_ms(video_path)
+            if video_dur_ms <= 0:
+                try:
+                    import cv2
+                    cap_d = cv2.VideoCapture(video_path)
+                    fps_d = cap_d.get(cv2.CAP_PROP_FPS) or 25.0
+                    fcount_d = cap_d.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+                    video_dur_ms = int((fcount_d / fps_d) * 1000)
+                    cap_d.release()
+                except Exception:
+                    video_dur_ms = 60000
+
+            # 1. Khởi tạo track âm thanh lồng tiếng trống bằng pydub
+            dubbed_audio = AudioSegment.silent(duration=max(1000, video_dur_ms))
+            total_segments = len(segments)
+            
+            for idx, seg in enumerate(segments):
+                start_time = seg['start']
+                end_time = seg['end']
+                sub_dur = end_time - start_time
+                
+                if sub_dur <= 0 or not seg.get('text', '').strip():
+                    continue
+                    
+                if progress_callback:
+                    progress_callback(f"Đang sinh giọng đọc AI cho câu {idx+1}/{total_segments}...")
+                    
+                # Tạo file âm thanh tạm thời
+                raw_audio_path = os.path.join(temp_dir, f"raw_{idx}.mp3")
+                aligned_audio_path = os.path.join(temp_dir, f"aligned_{idx}.mp3")
+                
+                # Sinh giọng đọc
+                success = generate_tts(seg['text'], voice, raw_audio_path)
+                if not success or not os.path.exists(raw_audio_path):
+                    continue
+                    
+                # Tính toán hệ số tốc độ
+                tts_dur = get_audio_duration(raw_audio_path)
+                if tts_dur <= 0:
+                    continue
+                    
+                speed_factor = tts_dur / sub_dur
+                
+                # Căn chỉnh tốc độ đọc nếu tốc độ thực tế dài hơn thời gian phụ đề
+                if speed_factor > 1.05:
+                    speed_adjust_audio(raw_audio_path, aligned_audio_path, speed_factor)
+                else:
+                    speed_adjust_audio(raw_audio_path, aligned_audio_path, 1.0)
+                    
+                # Ghi đè âm thanh vào track chính theo đúng mốc thời gian (quy đổi ra ms)
+                start_ms = int(start_time * 1000)
+                target_ms = int(sub_dur * 1000)
+                try:
+                    aligned_audio = AudioSegment.from_file(aligned_audio_path)
+                    if len(aligned_audio) > target_ms:
+                        aligned_audio = aligned_audio[:target_ms]
+                    dubbed_audio = dubbed_audio.overlay(aligned_audio, position=start_ms)
+                except Exception as e:
+                    print(f"Loi chen am thanh phan doan {idx}: {e}")
+                    
+            # Xuất file âm thanh lồng tiếng tổng hợp
+            final_dubbed_wav = os.path.join(temp_dir, "final_dubbed_voice.wav")
+            if progress_callback:
+                progress_callback("Đang xuất file lồng tiếng tổng hợp...")
+            with open(final_dubbed_wav, "wb") as wav_file:
+                dubbed_audio.export(wav_file, format="wav")
+        else:
+            if progress_callback:
+                progress_callback("⏭️ Đã tắt 'Lồng tiếng TTS' (enable_dubbing=False). Giữ nguyên track âm thanh gốc của video.")
         
-    return output_video_path, overflowed_segments
+        # 2. Xử lý video nếu ghi đè phụ đề hoặc cần xóa watermark bằng OpenCV
+        video_to_mix = video_path
+        overflowed_segments = []
+        
+        remove_algo = preset.get("remove_algo", "opencv") if preset else "opencv"
+        smart_pos = preset.get("smart_pos", False) if preset else False
+        
+        # Kiểm tra xem có bất kỳ đoạn phụ đề nào có bbox riêng (Smart Pos) không
+        has_segment_bbox = any(s.get('bbox') for s in segments)
+        
+        # Chạy OpenCV nếu có selected_bbox, selected_bboxes, chèn logo, segment có bbox, title_bbox, logo_bbox hoặc burn_subtitles
+        run_opencv_watermark = bool(selected_bbox or selected_bboxes or logo_path or has_segment_bbox or title_bbox or logo_bbox or burn_subtitles)
+        
+        if run_opencv_watermark:
+            if progress_callback:
+                if burn_subtitles and segments:
+                    progress_callback(f"🔥 Đang ghi đè {len(segments)} câu phụ đề tiếng Việt & xử lý xóa watermark bằng OpenCV...")
+                else:
+                    progress_callback("Đang thực hiện xử lý ảnh xóa watermark & chèn logo/tiêu đề bằng OpenCV...")
+            temp_burned_video = os.path.join(temp_dir, "temp_burned_video.mp4")
+            process_video_subtitles(
+                video_path=video_path,
+                segments=segments,
+                output_temp_video=temp_burned_video,
+                default_bbox=selected_bbox,
+                preset=preset,
+                progress_callback=progress_callback,
+                draw_text=burn_subtitles,
+                selected_bboxes=selected_bboxes,
+                logo_path=logo_path,
+                title_text=title_text,
+                title_bbox=title_bbox,
+                logo_bbox=logo_bbox
+            )
+            video_to_mix = temp_burned_video
+            
+        # 4. Sử dụng FFmpeg xuất video thành phẩm
+        if progress_callback:
+            progress_callback("Đang thực hiện kết xuất video thành phẩm...")
+            
+        # Xây dựng các bộ lọc video cho FFmpeg nếu có
+        ffmpeg_vf = []
+        use_delogo = (selected_bbox and remove_algo == "ffmpeg")
+        if use_delogo:
+            x, y, w, h = selected_bbox
+            ffmpeg_vf.append(f"delogo=x={x}:y={y}:w={w}:h={h}")
+
+        if not enable_dubbing or not final_dubbed_wav or not os.path.exists(final_dubbed_wav):
+            # KHÔNG LỒNG TIẾNG: Kết hợp video với audio gốc
+            if os.path.abspath(video_to_mix) != os.path.abspath(video_path):
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", video_to_mix,
+                    "-i", video_path,
+                    "-map", "0:v:0",
+                    "-map", "1:a?",
+                    "-c:v", "copy",
+                    "-c:a", "copy",
+                    "-movflags", "+faststart",
+                    out_tmp_video
+                ]
+            else:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", video_to_mix,
+                    "-c:v", "copy",
+                    "-c:a", "copy",
+                    "-movflags", "+faststart",
+                    out_tmp_video
+                ]
+            try:
+                _run_ffmpeg(cmd, "Xuat video khong long tieng")
+            except Exception:
+                cmd_fallback = [
+                    "ffmpeg", "-y",
+                    "-i", video_to_mix,
+                    "-i", video_path,
+                    "-map", "0:v:0",
+                    "-map", "1:a?",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    out_tmp_video
+                ]
+                _run_ffmpeg(cmd_fallback, "Xuat video fallback audio")
+        elif bg_volume == 0:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", video_to_mix,
+                "-i", final_dubbed_wav,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-filter:a:1", f"volume={dub_volume}"
+            ]
+            if ffmpeg_vf:
+                cmd.extend([
+                    "-vf", ",".join(ffmpeg_vf),
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-crf", "23"
+                ])
+            else:
+                cmd.extend([
+                    "-c:v", "copy"
+                ])
+            cmd.extend([
+                "-shortest",
+                out_tmp_video
+            ])
+            _run_ffmpeg(cmd, "Xuat video long tieng bg=0")
+        else:
+            # Trộn nhạc nền video gốc (giảm âm lượng) với giọng lồng tiếng
+            if ffmpeg_vf:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", video_to_mix,
+                    "-i", final_dubbed_wav,
+                    "-i", video_path,
+                    "-filter_complex", f"[0:v]{','.join(ffmpeg_vf)}[v_filtered];[2:a]volume={bg_volume}[bg];[1:a]volume={dub_volume}[fg];[bg][fg]amix=inputs=2:duration=first[a]",
+                    "-map", "[v_filtered]",
+                    "-map", "[a]",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-crf", "23",
+                    out_tmp_video
+                ]
+            else:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", video_to_mix,
+                    "-i", final_dubbed_wav,
+                    "-i", video_path,
+                    "-filter_complex", f"[2:a]volume={bg_volume}[bg];[1:a]volume={dub_volume}[fg];[bg][fg]amix=inputs=2:duration=first[a]",
+                    "-map", "0:v:0",
+                    "-map", "[a]",
+                    "-c:v", "copy",
+                    out_tmp_video
+                ]
+            _run_ffmpeg(cmd, "Xuat video long tieng")
+        
+        # Kiểm tra và atomic rename file đầu ra
+        if not os.path.exists(out_tmp_video) or os.path.getsize(out_tmp_video) == 0:
+            raise RuntimeError(f"FFmpeg không tạo được file đầu ra hợp lệ: {output_video_path}")
+
+        if os.path.exists(output_video_path):
+            try:
+                os.remove(output_video_path)
+            except Exception:
+                pass
+        shutil.move(out_tmp_video, output_video_path)
+
+        return output_video_path, overflowed_segments
+
+    finally:
+        # Dọn dẹp an toàn thư mục tạm
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        if os.path.exists(out_tmp_video):
+            try:
+                os.remove(out_tmp_video)
+            except Exception:
+                pass
 
 
 def format_ass_time(seconds):
