@@ -1,4 +1,11 @@
 import os
+import sys
+if hasattr(sys.stdout, 'reconfigure'):
+    try: sys.stdout.reconfigure(encoding='utf-8')
+    except Exception: pass
+if hasattr(sys.stderr, 'reconfigure'):
+    try: sys.stderr.reconfigure(encoding='utf-8')
+    except Exception: pass
 import asyncio
 import shutil
 import subprocess
@@ -952,6 +959,14 @@ def create_dubbed_video(video_path, segments, voice, output_video_path, bg_volum
             x, y, w, h = selected_bbox
             ffmpeg_vf.append(f"delogo=x={x}:y={y}:w={w}:h={h}")
 
+        has_orig_audio = False
+        try:
+            cmd_probe = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", video_path]
+            p_res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=4)
+            has_orig_audio = bool(p_res.stdout.strip())
+        except Exception:
+            has_orig_audio = False
+
         if not enable_dubbing or not final_dubbed_wav or not os.path.exists(final_dubbed_wav):
             # KHÔNG LỒNG TIẾNG: Kết hợp video với audio gốc
             if os.path.abspath(video_to_mix) != os.path.abspath(video_path):
@@ -992,14 +1007,16 @@ def create_dubbed_video(video_path, segments, voice, output_video_path, bg_volum
                     out_tmp_video
                 ]
                 _run_ffmpeg(cmd_fallback, "Xuat video fallback audio")
-        elif bg_volume == 0:
+        elif bg_volume == 0 or not has_orig_audio:
             cmd = [
                 "ffmpeg", "-y",
                 "-i", video_to_mix,
                 "-i", final_dubbed_wav,
                 "-map", "0:v:0",
                 "-map", "1:a:0",
-                "-filter:a:1", f"volume={dub_volume}"
+                "-filter:a:1", f"volume={dub_volume}",
+                "-c:a", "aac",
+                "-b:a", "192k"
             ]
             if ffmpeg_vf:
                 cmd.extend([
@@ -1031,6 +1048,8 @@ def create_dubbed_video(video_path, segments, voice, output_video_path, bg_volum
                     "-c:v", "libx264",
                     "-preset", "ultrafast",
                     "-crf", "23",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
                     out_tmp_video
                 ]
             else:
@@ -1043,6 +1062,8 @@ def create_dubbed_video(video_path, segments, voice, output_video_path, bg_volum
                     "-map", "0:v:0",
                     "-map", "[a]",
                     "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
                     out_tmp_video
                 ]
             _run_ffmpeg(cmd, "Xuat video long tieng")
